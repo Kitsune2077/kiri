@@ -71,7 +71,7 @@ mod tests {
     fn a_list_is_normalized_and_deduplicated() {
         let body = json!({"mirrors": ["docker.1ms.run", "https://docker.1ms.run/", " https://docker.m.daocloud.io/docker.io ", "https://docker.1ms.run/v2"]});
         let urls: Vec<String> = normalize(body["mirrors"].as_array().unwrap()).unwrap().iter().map(Mirror::as_url).collect();
-        assert_eq!(urls, ["https://docker.1ms.run", "https://m.daocloud.io/docker.io"]);
+        assert_eq!(urls, ["https://docker.1ms.run", "https://docker.m.daocloud.io/docker.io"]);
     }
 
     #[test]
