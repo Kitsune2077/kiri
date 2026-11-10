@@ -56,6 +56,8 @@ mod kubeconfig;
 #[cfg(unix)]
 mod machine;
 #[cfg(unix)]
+mod registry_mirror;
+#[cfg(unix)]
 mod run;
 #[cfg(unix)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
@@ -88,6 +90,7 @@ usage: kiri COMMAND          docker's commands, on Kiri: kiri run, ps, exec,
        kiri setup [--use] [--no-agent] | kiri setup --uninstall
        kiri build-with [docker|kiri]   which builder docker build uses
        kiri domains [set [--http N] [--https N] | reset]   the *.kiri.local routers' ports
+       kiri registry-mirror list | add ADDRESS | remove ADDRESS   Docker Hub mirrors
        kiri update [--check]      update Kiri (with a container: docker's update)
        kiri diag logs [-f] [--ui|--engine|--cli] [--errors] [-n N]
        kiri diag report [--out PATH] [--send]   (a file to send us, tokens taken out)
@@ -162,6 +165,8 @@ fn main() -> ExitCode {
         Some("build-with") => buildwith::cli(&args[1..]),
         #[cfg(unix)]
         Some("domains") => domains_cli::run(&args[1..]),
+        #[cfg(unix)]
+        Some("registry-mirror") => registry_mirror::run(&args[1..]),
         #[cfg(unix)]
         Some("k8s") => k8s::run(&args[1..]),
         #[cfg(unix)]
