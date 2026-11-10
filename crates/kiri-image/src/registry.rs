@@ -1542,7 +1542,7 @@ mod tests {
         assert_eq!(image.layers.len(), 1);
         quit(&mirror);
         quit(&origin);
-        assert!(mirror_seen.join().unwrap().iter().any(|p| p.ends_with("/manifests/latest")));
+        assert!(mirror_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
         assert!(origin_seen.join().unwrap().is_empty(), "the origin is not asked when the mirror has it");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1560,8 +1560,8 @@ mod tests {
         assert_eq!(image.name, "alpine:3.22");
         quit(&mirror);
         quit(&origin);
-        assert!(mirror_seen.join().unwrap().iter().any(|p| p.ends_with("/manifests/latest")));
-        assert!(origin_seen.join().unwrap().iter().any(|p| p.ends_with("/manifests/latest")));
+        assert!(mirror_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
+        assert!(origin_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")));
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1585,10 +1585,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A registry that serves one image (`test/image`): an index with one
-    /// linux/amd64 manifest, its config and one layer. `manifest_status`
-    /// answers a manifest request instead of the image when it is not 200,
-    /// for a mirror that does not have it.
+    /// A registry that serves one image under any repository name: an index
+    /// with one linux/amd64 manifest, its config and one layer.
+    /// `manifest_status` answers a manifest request instead of the image
+    /// when it is not 200, for a mirror that does not have it.
     fn image_server(manifest_status: u16) -> (String, std::thread::JoinHandle<Vec<String>>) {
         let layer: Vec<u8> = b"kiri registry mirror test layer".to_vec();
         let layer_digest = sha256_digest(&layer);
@@ -1641,16 +1641,15 @@ mod tests {
                 seen.push(path.clone());
                 let (status, body, kind): (u16, Vec<u8>, &str) = if path == "/v2/" {
                     (200, b"{}".to_vec(), "application/json")
-                } else if path.starts_with("/v2/test/image/manifests/") {
+                } else if let Some(reference) = path.split_once("/manifests/").map(|(_, r)| r) {
                     if manifest_status != 200 {
                         (manifest_status, Vec::new(), "application/json")
-                    } else if path.ends_with("/latest") {
-                        (200, index.clone().into_bytes(), "application/vnd.oci.image.index.v1+json")
-                    } else {
+                    } else if reference.starts_with("sha256:") {
                         (200, manifest.clone().into_bytes(), "application/vnd.docker.distribution.manifest.v2+json")
+                    } else {
+                        (200, index.clone().into_bytes(), "application/vnd.oci.image.index.v1+json")
                     }
-                } else if path.starts_with("/v2/test/image/blobs/") {
-                    let digest = path.rsplit('/').next().unwrap_or("");
+                } else if let Some(digest) = path.split_once("/blobs/").map(|(_, d)| d) {
                     if digest == config_digest {
                         (200, config.clone(), "application/octet-stream")
                     } else if digest == layer_digest {
