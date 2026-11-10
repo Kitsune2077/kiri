@@ -19,6 +19,12 @@ on:
 permissions:
   contents: read
 
+# The workspace version is 0.0.0: a release takes its version from its tag.
+# An MSI built from a checkout must be newer than the installed one to
+# replace it, so both halves are stamped with the next patch.
+env:
+  KIRI_BUILD_VERSION: "0.1.19"
+
 concurrency:
   group: windows-package-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -48,6 +54,11 @@ jobs:
         with:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
+      - name: Stamp the build version
+        run: |
+          # A Windows checkout has CRLF; the lookahead keeps it that way.
+          perl -0pi -e 's/^version = "0\.0\.0"(?=\r?$)/version = "$ENV{KIRI_BUILD_VERSION}"/m' Cargo.toml
+          grep -m1 '^version = ' Cargo.toml
       - name: Build the static engine and Kiri Linux
         run: |
           sudo apt-get update -qq
@@ -78,6 +89,13 @@ jobs:
         with:
           name: kiri-linux-x86_64
           path: ${{ runner.temp }}\linux
+      - name: Stamp the build version
+        shell: pwsh
+        run: |
+          $s = Get-Content Cargo.toml -Raw
+          $s = $s -replace '(?m)^version = "0\.0\.0"(?=\r?$)', "version = `"$env:KIRI_BUILD_VERSION`""
+          [IO.File]::WriteAllText((Join-Path $PWD 'Cargo.toml'), $s, (New-Object Text.UTF8Encoding $false))
+          Select-String -Path Cargo.toml -Pattern '^version = ' | Select-Object -First 1
       - name: Install WiX 5
         shell: pwsh
         run: |
