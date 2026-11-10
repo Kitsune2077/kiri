@@ -26,7 +26,11 @@ maker's own build machines.
    - Mac: `cargo xtask guest`, `cargo xtask release` and `cargo xtask dmg`
      (the VM's guest, the signed app, the disk image; all in `xtask/`), then
      Apple's notarization (`xcrun notarytool`)
-   - Windows: `cargo xtask msi` (the installer, from `installer/windows`)
+   - Windows: `cargo xtask msi` (the installer, from `installer/windows`).
+     A checkout without a Rust toolchain can build the same bundle and MSI
+     with `.github/workflows/windows-package.yml`: the Linux half is built on
+     an Ubuntu runner and handed to the Windows runner in
+     `KIRI_LINUX_ARTIFACTS`
    - Linux: `scripts/ci/linux-build.sh` (all `.deb` and `.rpm` packages),
      then `packaging/linux/test-host.sh`, which installs them on Ubuntu and
      Fedora and runs containers through them. A build that doesn't install

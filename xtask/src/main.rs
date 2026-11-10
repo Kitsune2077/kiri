@@ -387,19 +387,29 @@ fn windows(root: &Path, debug: bool, arch: WinArch) -> io::Result<()> {
     // The static (musl) engine, which runs in Kiri Linux and in Ubuntu, and
     // Kiri Linux itself (scripts/kiri-linux.sh), built in WSL: on Windows,
     // the default distro, with Rust installed. zig cross-compiles, so
-    // either architecture builds in either WSL.
+    // either architecture builds in either WSL. CI builds the same two
+    // scripts on a Linux runner and passes the files in
+    // KIRI_LINUX_ARTIFACTS, since GitHub's Windows runners have no WSL
+    // distro with a Rust toolchain.
     let linux = root.join(format!("target/linux-{}-musl", arch.linux()));
     if !cfg!(windows) {
         return Err(io::Error::other("the Windows bundle is built on Windows, in WSL"));
     }
     fs::create_dir_all(&linux)?;
-    let wsl = |path: &Path| -> io::Result<String> {
-        let out = Command::new("wsl.exe").args(["wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")).output()?;
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    };
-    let (src, out_dir) = (wsl(root)?, wsl(&linux)?);
-    run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux()]))?;
-    run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
+    if let Some(dir) = std::env::var_os("KIRI_LINUX_ARTIFACTS") {
+        let dir = PathBuf::from(dir);
+        for b in ["kiri", "kiri-init", "kiri-linux.tar.gz"] {
+            fs::copy(dir.join(b), linux.join(b))?;
+        }
+    } else {
+        let wsl = |path: &Path| -> io::Result<String> {
+            let out = Command::new("wsl.exe").args(["wslpath", "-a"]).arg(path.to_string_lossy().replace('\\', "/")).output()?;
+            Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+        };
+        let (src, out_dir) = (wsl(root)?, wsl(&linux)?);
+        run(Command::new("wsl.exe").args(["--", "bash", &format!("{src}/scripts/windows-engine.sh"), &src, &out_dir, arch.linux()]))?;
+        run(Command::new("wsl.exe").args(["--", "sh", &format!("{src}/scripts/kiri-linux.sh"), &src, &out_dir, &format!("{out_dir}/kiri-linux.tar.gz"), arch.linux()]))?;
+    }
     // Assemble the bundle first: the engine, Kiri Linux, the docker CLI,
     // Compose and buildx (pinned, checked, as Kiri.app bundles them) and the
     // install scripts. kiri-win is built last, with the SHA-256 of each of

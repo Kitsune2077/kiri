@@ -1,0 +1,101 @@
+# Rust tests and the Windows installer on GitHub's machines: the machine Kiri
+# is developed on has no Rust toolchain.
+#
+# The Linux half of the bundle is built on an Ubuntu runner, by the same two
+# scripts `cargo xtask windows` runs in WSL. The Windows runner then builds
+# kiri-win.exe, kiri.exe and the docker CLI half, finds the Linux files
+# through KIRI_LINUX_ARTIFACTS, and packs the MSI with WiX. A pull request
+# runs the tests and the Linux half only; main and a manual run build the MSI.
+#
+# The page tests and translations stay in ui-tests.yml.
+name: Windows package
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rust-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: The image client, registry mirrors included
+        run: cargo test -p kiri-image
+      - name: The daemon and the CLI compile
+        run: cargo test -p kiri --no-run
+      - name: The registry-mirrors setting
+        run: cargo test -p kiri registry_mirrors
+
+  linux-engine:
+    needs: rust-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the static engine and Kiri Linux
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-venv
+          # The same scripts `cargo xtask windows` runs in WSL: a static
+          # (musl) kiri and kiri-init, then Kiri Linux around them.
+          bash scripts/windows-engine.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/linux" x86_64
+          sh scripts/kiri-linux.sh "$GITHUB_WORKSPACE" "$RUNNER_TEMP/linux" "$RUNNER_TEMP/linux/kiri-linux.tar.gz" x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kiri-linux-x86_64
+          path: ${{ runner.temp }}/linux/
+          if-no-files-found: error
+
+  windows-msi:
+    needs: linux-engine
+    # A pull request runs the tests and the Linux half; the installer comes
+    # from main or a manual run.
+    if: github.event_name != 'pull_request'
+    runs-on: windows-2022
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/download-artifact@v4
+        with:
+          name: kiri-linux-x86_64
+          path: ${{ runner.temp }}\linux
+      - name: Install WiX 5
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 5.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Append
+      - name: Build the bundle and the MSI
+        shell: pwsh
+        env:
+          # windows() copies kiri, kiri-init and kiri-linux.tar.gz from here
+          # instead of building them in WSL.
+          KIRI_LINUX_ARTIFACTS: ${{ runner.temp }}\linux
+        run: |
+          wix extension add -g WixToolset.UI.wixext/5.0.2
+          wix extension add -g WixToolset.Util.wixext/5.0.2
+          cargo xtask windows
+          cargo xtask msi-pack
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Kiri-msi
+          path: target/Kiri-*-x86_64.msi
+          if-no-files-found: error
