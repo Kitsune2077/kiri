@@ -607,7 +607,10 @@ impl Client {
             let e = last.unwrap_or_else(|| Error::Manifest("no registry to pull from".into()));
             return Err(not_found(e, name));
         };
-        self.download_layers(store, name, &resolved, platform, progress, cancel)
+        // The layers come from where the manifest did, asked the same way: a
+        // mirror without the user's credentials, Docker Hub with them.
+        let anonymous = (resolved.target.registry != name.registry).then(|| self.anonymous());
+        anonymous.as_ref().unwrap_or(self).download_layers(store, name, &resolved, platform, progress, cancel)
     }
 
     /// Reads the manifest for `r` and picks this platform's: the first half
@@ -1548,6 +1551,25 @@ mod tests {
     }
 
     #[test]
+    fn a_mirror_is_never_sent_the_docker_hub_sign_in() {
+        let (mirror, mirror_seen) = image_server(200);
+        let root = std::env::temp_dir().join(format!("kiri-mirror-creds-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let targets = vec![name.via(&mirror, None), name.clone()];
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let signed_in = test_client().with_credentials(Some(Credentials { username: "alice".into(), password: "hub-password".into(), registry_token: "hub-token".into(), ..Default::default() }));
+        let image = signed_in.pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
+        assert_eq!(image.name, "alpine:3.22");
+        quit(&mirror);
+        let seen = mirror_seen.join().unwrap();
+        assert!(seen.iter().any(|p| p.contains("/blobs/")), "the layers came from the mirror: {seen:?}");
+        let sent: Vec<&String> = seen.iter().filter(|p| p.ends_with("(with credentials)")).collect();
+        assert!(sent.is_empty(), "the mirror was sent the Docker Hub sign-in: {sent:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_mirror_without_the_image_falls_back_to_the_registry() {
         let (mirror, mirror_seen) = image_server(404);
         let (origin, origin_seen) = image_server(200);
@@ -1638,7 +1660,10 @@ mod tests {
                     break;
                 }
                 let path = head.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_string();
-                seen.push(path.clone());
+                // A request that carried credentials is marked, so a test can
+                // tell what a mirror was sent.
+                let authed = head.to_ascii_lowercase().contains("\nauthorization:");
+                seen.push(if authed { format!("{path} (with credentials)") } else { path.clone() });
                 let (status, body, kind): (u16, Vec<u8>, &str) = if path == "/v2/" {
                     (200, b"{}".to_vec(), "application/json")
                 } else if let Some(reference) = path.split_once("/manifests/").map(|(_, r)| r) {
