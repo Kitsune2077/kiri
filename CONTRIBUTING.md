@@ -5,8 +5,19 @@ Thanks for helping. Issues and pull requests are welcome.
 ## Before you start
 
 For anything larger than a small fix, open an issue first so we can agree on
-the approach. Kiri aims to be small and fast: changes that add a dependency, a
-background process or startup time need a good reason.
+the approach, and wait for that before you write the code. Kiri aims to be
+small and fast: changes that add a dependency, a background process or
+startup time need a good reason.
+
+Bug reports need the Kiri version and system, the exact commands you ran and
+the output you got, as the issue form asks. A report we can't reproduce, or a
+problem found only by reading the code, may be closed until it can be shown
+on a real machine.
+
+Keep at most 3 pull requests open at a time. Each one takes a maintainer's
+time to review, and a few at a time get reviewed sooner. Pull requests beyond
+that, or larger changes without an agreed issue, are closed; you're welcome
+to reopen them one at a time later.
 
 ## Building and testing
 
@@ -35,6 +46,17 @@ once; see the README.
   `tests/ui/parity-allow.txt` gives the reason. A new line there needs a
   maintainer's OK. It also runs on every pull request; on Linux, point
   `CHROME` at your Chrome or Chromium.
+
+## Speed is a feature
+
+Kiri is small and fast on purpose, and every pull request is checked for it.
+The Speed check builds main and your change, runs both engines side by side
+on one machine and compares them: `docker run`, API round trips, the daemon's
+memory, the system calls one container costs, and the binaries' size. It
+fails when the change is slower than main past the limits in
+`scripts/perf.py`; the table is in the check's summary. To run it yourself on
+Linux, build both with `cargo xtask linux` and run
+`scripts/perf-run.sh <main's build> <your build> <work folder>`.
 
 ## Pull requests
 
