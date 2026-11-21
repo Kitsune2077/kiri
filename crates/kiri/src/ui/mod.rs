@@ -556,6 +556,25 @@ fn proxy(save: Option<serde_json::Value>) {
     }
 }
 
+/// Settings → Registries: reads (or saves, then reads) daemon.json's
+/// insecure registries and Docker Hub mirrors.
+fn registry_config(save: Option<serde_json::Value>) {
+    if let Some(body) = save {
+        match client::request("POST", "/kiri/registries", Some(&body)) {
+            Ok(r) if r.ok() => emit(notice("ok", &tr("Registry settings saved"))),
+            Ok(r) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &r.error())]))),
+            Err(e) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)]))),
+        }
+    }
+    match client::get("/kiri/registries") {
+        Ok(mut v) => {
+            v["type"] = "registryconfig".into();
+            emit(v.to_string());
+        }
+        Err(e) => emit(serde_json::json!({"type": "registryconfig", "error": e.to_string()}).to_string()),
+    }
+}
+
 /// Settings → Domains: reads (or moves, then reads) the routers' ports.
 fn router_ports(set: Option<serde_json::Value>) {
     if let Some(body) = set {
@@ -1930,6 +1949,16 @@ fn handle(text: &str, tx: &Sender<Cmd>, autostart: bool, view: Option<&str>) {
         "setproxy" => {
             let body = msg.value;
             std::thread::spawn(move || proxy(Some(body)));
+            Ok(())
+        }
+        // Settings → Registries: daemon.json's lists.
+        "registryconfig" => {
+            std::thread::spawn(|| registry_config(None));
+            Ok(())
+        }
+        "setregistryconfig" => {
+            let body = msg.value;
+            std::thread::spawn(move || registry_config(Some(body)));
             Ok(())
         }
         // Settings → Domains: the routers' ports.

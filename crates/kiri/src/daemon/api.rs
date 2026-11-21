@@ -151,9 +151,9 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
-        // Settings → Registry mirrors, and `kiri registry-mirror`.
-        ("GET", "/kiri/registry-mirrors") => return reply(w, Ok(super::registry_mirrors::report()), 200),
-        ("POST", "/kiri/registry-mirrors") => return reply(w, set_registry_mirrors(req, engine), 200),
+        // daemon.json's registry keys: Settings → Registries, `kiri registry`.
+        ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
+        ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
         ("GET", "/kiri/domains") => return reply(w, Ok(super::domains::report()), 200),
@@ -480,6 +480,10 @@ fn info(engine: &Engine) -> Value {
         // Not in Docker's /info (the ping's Builder-Version header is), but
         // tools print it: the classic builder API, served by builder.rs.
         "BuilderVersion": "1",
+        // `docker info`'s Registry, Insecure Registries and Registry Mirrors:
+        // daemon.json's, as Docker reports its own.
+        "IndexServerAddress": "https://index.docker.io/v1/",
+        "RegistryConfig": super::daemon_json::info(),
         "KiriAgentMemory": engine.agent_rss().unwrap_or(0),
         "KiriVmAwake": engine.is_awake(),
         "KiriStopped": engine.is_stopped(),
@@ -953,13 +957,13 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
-fn set_registry_mirrors(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
+fn set_registries(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
-    let before = super::registry_mirrors::list();
-    let report = super::registry_mirrors::set(&body).map_err(Error::BadRequest)?;
-    // BuildKit reads its mirrors from buildkitd.toml at each start; an
+    let before = super::daemon_json::current();
+    let report = super::daemon_json::set(&body).map_err(Error::BadRequest)?;
+    // BuildKit reads its registries from buildkitd.toml at each start; an
     // unchanged save leaves a running builder alone.
-    if super::registry_mirrors::list() != before {
+    if *super::daemon_json::current() != *before {
         super::builder::refresh(engine);
     }
     Ok(report)

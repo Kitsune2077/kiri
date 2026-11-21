@@ -1230,6 +1230,14 @@ pub fn on_message(msg: &str) {
             let body = c.value;
             std::thread::spawn(move || proxy(Some(body)));
         }
+        // Settings → Registries: daemon.json's lists, in the engine's distro.
+        "registryconfig" => {
+            std::thread::spawn(|| registry_config(None));
+        }
+        "setregistryconfig" => {
+            let body = c.value;
+            std::thread::spawn(move || registry_config(Some(body)));
+        }
         // Settings → Resources: WSL's CPUs and memory, in .wslconfig.
         "resources" => crate::wslconfig::resources(None),
         "setresources" => crate::wslconfig::resources(Some(c.value)),
@@ -1479,6 +1487,25 @@ fn proxy(set: Option<Value>) {
             v
         }
         Err(e) => json!({"type": "proxy", "error": e.to_string()}),
+    };
+    emit(ev.to_string());
+}
+
+/// Settings → Registries: the engine's daemon.json (in its WSL distro):
+/// insecure registries and Docker Hub mirrors.
+fn registry_config(set: Option<Value>) {
+    if let Some(body) = set {
+        match expect_ok(client::request("POST", "/kiri/registries", Some(&body))) {
+            Ok(()) => emit(notice("ok", &tr("Registry settings saved"))),
+            Err(e) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)]))),
+        }
+    }
+    let ev = match client::get("/kiri/registries") {
+        Ok(mut v) => {
+            v["type"] = json!("registryconfig");
+            v
+        }
+        Err(e) => json!({"type": "registryconfig", "error": e.to_string()}),
     };
     emit(ev.to_string());
 }

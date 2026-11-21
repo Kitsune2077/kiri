@@ -49,6 +49,16 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
 - **Images**: `pull` (with `docker login` credentials), `push`, `tag`,
   `save`, `load`, `history`, `search`, `image prune`, `system df`;
   **amd64 images run through Rosetta**, `--platform` honoured
+- **Private registries**: Kiri's own `~/.kiri/daemon.json` takes Docker's
+  `insecure-registries` (hosts such as `registry.lan:5000`, or networks
+  such as `10.0.0.0/8`, reached with a self-signed certificate or plain
+  HTTP: HTTPS without checking the certificate first, then HTTP) and
+  `registry-mirrors` (Docker Hub pull-through mirrors, tried in order).
+  They apply to `pull`, `push`, `login` and `build`, only for the hosts
+  listed, and an edit applies without a restart. Settings → Registries and
+  `kiri registry insecure|mirror add|remove` edit the same file; Docker
+  Desktop's daemon.json is never read or changed. A registry with a
+  self-signed certificate is reached only once it is listed, as with Docker
 - **Builds**: `docker build` / `buildx build` through BuildKit running in a
   Kiri container (buildx's docker-container driver), stopped when idle;
   on Apple silicon, amd64 build steps run through Rosetta too

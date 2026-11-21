@@ -163,3 +163,24 @@ pull-auth-null-fields	#654	X-Registry-Auth with JSON null fields (Testcontainers
 pull-auth-null-std-b64	#654	X-Registry-Auth with null fields in standard padded base64 must sign in too
 pull-auth-all-null	#654	X-Registry-Auth with every field null is no sign-in: the pull stays anonymous
 network-rm-failed-start-gateway-dns	#248	a start that failed on a network left a DNS listener at its gateway after the network was removed
+insecure-http-unlisted-refused	#329	a plain-HTTP registry daemon.json doesn't list must stay refused
+insecure-tls-unlisted-refused	#329	a self-signed registry daemon.json doesn't list must stay refused
+insecure-login-unlisted-refused	#329	docker login must not send a password over plain HTTP to a registry daemon.json doesn't list
+insecure-cli-add	#329	there was no way to list an insecure registry: no daemon.json, no kiri registry, no Settings
+insecure-cli-refuses-everything	#329	an insecure-registries network of every address must be refused: insecure is for listed hosts only
+insecure-http-pull	#329	pulling from a plain-HTTP registry on the network failed: only loopback registries were reached over HTTP
+insecure-http-push	#611	pushing to a plain-HTTP registry on the network failed: the push always used HTTPS
+insecure-selfsigned-pull	#329	pulling from a registry with a self-signed certificate failed UnknownIssuer with no way to allow it
+insecure-http-login	#329	docker login to a plain-HTTP registry failed: login always used HTTPS
+insecure-http-auth-pull	#329	pulling with credentials from a listed plain-HTTP registry failed
+insecure-other-port-still-refused	#329	an insecure entry must cover its own host and port only, as Docker matches it
+insecure-docker-info	#329	docker info listed no Insecure Registries
+insecure-build	#329	docker build FROM a plain-HTTP registry failed: buildkitd.toml had no http/insecure entry for it
+insecure-removed-refused	#329	a registry taken off the list must be refused again, without a restart
+insecure-hand-edit	#329	daemon.json edited by hand must apply at the next pull, without a restart
+insecure-hand-edit-keeps-keys	#329	saving from kiri registry must keep the other keys a hand-edited daemon.json has
+mirror-http-pull	#118	Docker Hub pulls could not go through a registry mirror; Docker's http:// mirrors were refused
+mirror-docker-info	#118	docker info listed no Registry Mirrors
+mirror-build	#118	docker build FROM a Docker Hub image did not use the configured mirror
+insecure-cli-remove	#329	kiri registry insecure remove must take a host off the list
+mirror-cli-add	#118	there was no way to add a Docker Hub mirror from the terminal into daemon.json

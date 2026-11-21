@@ -2778,7 +2778,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0,
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" },
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -4535,8 +4535,8 @@ function renderSettings() {
       <dt>${tr("Made by")}</dt><dd><a data-open-site="https://canestack.com">Canestack Labs</a></dd>
     </dl>
     <p class="muted">${tr("The name comes from the Igbo word ntakịrị, “small”.")}</p></div>`;
-  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${loginsOn() ? tab("registries", "lock", tr("Registries")) : ""}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
-    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" && loginsOn() ? registriesPane() : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
+  const html = `<div class="settings"><div class="tabs">${tab("appearance", "textaa", tr("Appearance"))}${tab("resources", "stack", tr("Resources"))}${tab("network", "globe", tr("Network"))}${tab("builds", "hammer", tr("Builds"))}${tab("registries", "lock", tr("Registries"))}${tab("kubernetes", "pods", "Kubernetes")}${tab("import", "stack", tr("Import"))}${tab("domains", "network", tr("Domains"))}${tab("diagnostics", "bug", tr("Diagnostics"))}${tab("about", "info", tr("About"))}</div>
+    ${prefs.tab === "diagnostics" ? diagPane() : prefs.tab === "about" ? aboutPane : prefs.tab === "domains" ? domainsPane : prefs.tab === "resources" ? `<div class="panes">${enginePane()}${resourcesPane()}</div>` : prefs.tab === "network" ? networkPane() : prefs.tab === "builds" ? buildsPane() : prefs.tab === "registries" ? `<div class="panes">${loginsOn() ? registriesPane() : ""}${regListPane("insecure")}${regListPane("mirrors")}</div>` : prefs.tab === "kubernetes" ? kubernetesPane() : prefs.tab === "import" ? importPane() : appearance}</div>`;
   // The container lists arrive every few seconds; rebuilding an unchanged page
   // closes an open menu. The font menus list names in the interface font: an
   // option in its own font made WebKit load every installed font (438 here)
@@ -4549,6 +4549,10 @@ function renderSettings() {
   settingsShown.html = html; settingsShown.el = $("content").firstElementChild;
   diagDrawn();
   for (const k of ["http", "https", "no_proxy"]) $(`px-${k}`)?.addEventListener("input", (ev) => { ui.pxDraft[k] = ev.target.value; });
+  for (const k of ["insecure", "mirrors"]) {
+    $(`reg-${k}`)?.addEventListener("input", (ev) => { ui.regAdd[k] = ev.target.value; });
+    $(`reg-${k}`)?.addEventListener("keydown", (ev) => { if (ev.key === "Enter") { ev.preventDefault(); regListAdd(k); } });
+  }
   for (const k of ["http", "https"]) $(`rp-${k}`)?.addEventListener("input", (ev) => {
     ui.rpDraft[k] = ev.target.value;
     const save = document.querySelector("#content [data-saverp]");
@@ -4586,7 +4590,7 @@ function show(view) {
   if (view === "compose") { cmp.open = null; cmp.asked = 0; cmpAsk(); }
   if (view === "usb") usbPoll();
   if (view === "share") { send("shares"); send("shareusage"); shPoll(); }
-  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
+  if (view === "settings") { if (!fontLists.families.length) send("fonts"); send("about"); send("logins"); send("resources"); send("proxy"); send("registryconfig"); send("routerports"); if (!ui.imp.sources) send("importsources"); if (prefs.tab === "diagnostics") diagOpen(); }
   render();
   // From the top, as a container's or pod's page opens: leaving a page scrolled
   // down (a long Terminal or Logs tab) otherwise opened the next view below its rows.
@@ -8180,6 +8184,7 @@ window.kiri = {
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
+      case "registryconfig": ui.regcfg = e; ui.regDraft = { insecure: [...(e["insecure-registries"] || [])], mirrors: [...(e["registry-mirrors"] || [])] }; ui.regAdd = { insecure: "", mirrors: "" }; if (ui.view === "settings") render(); break;
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
       case "detail": openDetail(e.id); break;
       case "inspect":
@@ -8280,7 +8285,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-g]"))) projectAsk(el.dataset.project, el.dataset.g);
   else if ((el = t("[data-group]"))) toggleGroup(el);
   else if (composeClick(t)) {}
-  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") send("logins"); if (prefs.tab === "diagnostics") diagOpen(); render(); }
+  else if ((el = t("[data-stab]"))) { prefs.tab = el.dataset.stab; if (prefs.tab === "about") send("about"); if (prefs.tab === "builds") send("buildwith"); if (prefs.tab === "registries") { send("logins"); send("registryconfig"); } if (prefs.tab === "diagnostics") diagOpen(); render(); }
   else if (diagClick(t)) {}
   else if ((el = t("[data-scale]"))) setPref("scale", +el.dataset.scale);
   else if ((el = t("[data-logsize]"))) setPref("logSize", +el.dataset.logsize);
@@ -8299,6 +8304,9 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-pxmode]"))) { ui.pxDraft.mode = el.dataset.pxmode; render(); }
   else if ((el = t("[data-pxc]"))) { ui.pxDraft.containers = !!+el.dataset.pxc; render(); }
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
+  else if ((el = t("[data-regadd]"))) regListAdd(el.dataset.regadd);
+  else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
+  else if ((el = t("[data-regsave]"))) send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } });
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }
@@ -11074,6 +11082,39 @@ function loginDone(e) {
   }
   signinRedraw();
   if (failed) document.querySelector(`[data-signin="${CSS.escape(failed)}"] [name="t"]`)?.select();
+}
+/* Settings → Registries: Kiri's daemon.json lists, with Docker's names
+   (`insecure-registries`, `registry-mirrors`), the same ones `kiri registry`
+   edits. Insecure: only the hosts and networks listed go without a checked
+   certificate. Mirrors: Docker Hub's, tried in order before Docker Hub. */
+const REG_KEY = { insecure: "insecure-registries", mirrors: "registry-mirrors" };
+function regListPane(k) {
+  const c = ui.regcfg, title = k === "insecure" ? tr("Insecure registries") : tr("Registry mirrors");
+  if (!c) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Loading…")}</p></div>`;
+  if (c.error) return `<div class="pane"><h3>${title}</h3><p class="muted">${tr("Start Kiri to change its registry settings. ({error})", { error: esc(c.error) })}</p></div>`;
+  const draft = ui.regDraft[k];
+  const rows = draft.length
+    ? draft.map((v, i) => `<div class="pref"><span class="t mono">${esc(v)}</span><button class="btn" data-regdel="${k}:${i}">${tr("Remove")}</button></div>`).join("")
+    : `<p class="muted">${k === "insecure" ? tr("None: every registry is checked over HTTPS.") : tr("No mirrors yet: Docker Hub images come from Docker Hub itself.")}</p>`;
+  const changed = JSON.stringify(draft) !== JSON.stringify(c[REG_KEY[k]] || []);
+  const about = k === "insecure"
+    ? tr("Registries reached without a verified certificate (self-signed, or plain HTTP). Kiri tries HTTPS without checking the certificate, then HTTP. Only the hosts and networks listed; every other registry is checked as usual.")
+    : tr("Docker Hub images pull through these in order; the first that has the image answers, and Docker Hub itself is the fallback. Other registries are pulled directly.");
+  const label = k === "insecure" ? tr("Host or network") : tr("Mirror address");
+  const hint = k === "insecure" ? "registry.lan:5000, 10.0.0.0/8" : "https://mirror.example.com";
+  const foot = k === "mirrors" ? `<p class="muted">${tr("Kept in {path} with Docker's names, for docker pull, push, login and build. Docker Desktop's file is left alone.", { path: `<span class="mono">${esc(c.path || "~/.kiri/daemon.json")}</span>` })}</p>${(c.problems || []).map((x) => `<p class="muted" role="alert">${tr("Skipped: {problem}", { problem: esc(x) })}</p>`).join("")}` : "";
+  return `<div class="pane"><h3>${title}</h3>
+    <p class="muted">${about}</p>
+    ${rows}
+    <div class="res-foot" style="margin-top:14px"><input class="field mono" id="reg-${k}" style="flex:1;max-width:420px" aria-label="${label}" value="${esc(ui.regAdd[k])}" placeholder="${hint}" spellcheck="false" autocomplete="off"><button class="btn" data-regadd="${k}">${tr("Add")}</button><span style="flex:1"></span><button class="btn primary" data-regsave="${k}"${changed ? "" : " disabled"}>${tr("Save")}</button></div>
+    ${foot}</div>`;
+}
+function regListAdd(k) {
+  const v = (ui.regAdd[k] || "").trim();
+  if (!v) return;
+  if (!ui.regDraft[k].includes(v)) ui.regDraft[k].push(v);
+  ui.regAdd[k] = "";
+  render();
 }
 /* Settings → Registries: where you're signed in, and signing in to another. */
 function registriesPane() {

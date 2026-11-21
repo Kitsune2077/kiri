@@ -1441,6 +1441,32 @@ t pull-no-auth "pull access denied" bash -c "$R logout localhost:5055 >/dev/null
 t push-no-auth "authentication required" bash -c "$R tag alpine localhost:5055/team/alp:2 && $R push localhost:5055/team/alp:2 2>&1"
 # Not pushed, so no RepoDigest: not alpine's from Docker Hub, nor one made up.
 t push-failed-no-digest "[]" $R image inspect localhost:5055/team/alp:2 --format '{{json .RepoDigests}}'
+# Docker's insecure-registries and registry-mirrors, in the engine's own
+# daemon.json (#329, #611, #118): the same registry at this computer's
+# network address, not loopback, is refused (and given no password) until
+# `kiri registry insecure add` lists it, then login, push and pull work over
+# plain HTTP; taken off the list, it is refused again. A Docker Hub image
+# only a plain-HTTP mirror (a second registry, no password) has pulls
+# through the mirror. The entries are taken out again at the end.
+if [ "$SYS" = mac ]; then HOSTIP=$(ipconfig getifaddr en0 || ipconfig getifaddr en1); else HOSTIP=$(hostname -I | cut -d' ' -f1); fi
+if [ -n "$HOSTIP" ]; then
+  $D run -d --name reg2 -p 5056:5000 registry:2 >/dev/null; ready http://localhost:5056/v2/
+  $D tag alpine localhost:5056/library/kiri-mirror-only:1 && $D push -q localhost:5056/library/kiri-mirror-only:1 >/dev/null && $D rmi localhost:5056/library/kiri-mirror-only:1 >/dev/null
+  t insecure-http-unlisted-refused "refused" bash -c "$R pull $HOSTIP:5055/team/alp:1 >/dev/null 2>&1 && echo pulled || echo refused"
+  t insecure-login-unlisted-refused "refused" bash -c "echo kiripass | $R login $HOSTIP:5055 -u kiriuser --password-stdin >/dev/null 2>&1 && echo signed in || echo refused"
+  t insecure-cli-add "$HOSTIP:5055" "$KIRI" registry insecure add "$HOSTIP:5055"
+  t insecure-http-login "Login Succeeded" bash -c "echo kiripass | $R login $HOSTIP:5055 -u kiriuser --password-stdin 2>&1"
+  t insecure-http-push "digest: sha256:" bash -c "$R tag alpine $HOSTIP:5055/team/alp:3 && $R push $HOSTIP:5055/team/alp:3 2>&1"
+  t insecure-http-auth-pull "3." bash -c "$R rmi $HOSTIP:5055/team/alp:3 >/dev/null && $R pull -q $HOSTIP:5055/team/alp:3 >/dev/null && $R run --rm $HOSTIP:5055/team/alp:3 cat /etc/alpine-release"
+  t insecure-docker-info "$HOSTIP:5055" bash -c "$D info 2>/dev/null | sed -n '/Insecure Registries/,/^ [A-Z]/p'"
+  t insecure-cli-remove "no insecure registries" "$KIRI" registry insecure remove "$HOSTIP:5055"
+  t insecure-removed-refused "refused" bash -c "$R rmi $HOSTIP:5055/team/alp:3 >/dev/null 2>&1; $R pull $HOSTIP:5055/team/alp:3 >/dev/null 2>&1 && echo pulled || echo refused"
+  t mirror-cli-add "http://$HOSTIP:5056" "$KIRI" registry mirror add "http://$HOSTIP:5056"
+  t mirror-http-pull "3." bash -c "$D pull -q kiri-mirror-only:1 >/dev/null && $D run --rm kiri-mirror-only:1 cat /etc/alpine-release"
+  t mirror-docker-info "http://$HOSTIP:5056/" bash -c "$D info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
+  "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
+  $D rmi kiri-mirror-only:1 >/dev/null 2>&1; $D rm -f reg2 >/dev/null
+fi
 $D rmi localhost:5055/team/alp:2 >/dev/null 2>&1; $D rm -f reg >/dev/null; rm -rf "$REG"
 
 section "limits, stats, top, pause, update"

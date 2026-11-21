@@ -142,23 +142,38 @@ pub fn host_addr(engine: &Engine) -> String {
     mirror_host(&engine.lock_net())
 }
 
-/// Adds `mirror` to `registry`'s list, in order, once.
-fn add_mirror(registries: &mut Vec<(String, Vec<String>)>, registry: &str, mirror: String) {
-    match registries.iter_mut().find(|(r, _)| r == registry) {
-        Some((_, mirrors)) => {
-            if !mirrors.contains(&mirror) {
-                mirrors.push(mirror);
-            }
+/// One `[registry."host"]` table of buildkitd.toml.
+#[derive(Default, Debug, PartialEq)]
+struct Table {
+    mirrors: Vec<String>,
+    http: bool,
+    insecure: bool,
+}
+
+/// The table for `registry`, made if it isn't there yet: BuildKit refuses a
+/// buildkitd.toml that names one twice, and Kiri's own mirror, daemon.json's
+/// mirrors and its insecure hosts may all cover the same one.
+fn table<'a>(tables: &'a mut Vec<(String, Table)>, registry: &str) -> &'a mut Table {
+    let i = match tables.iter().position(|(r, _)| r == registry) {
+        Some(i) => i,
+        None => {
+            tables.push((registry.to_owned(), Table::default()));
+            tables.len() - 1
         }
-        None => registries.push((registry.to_owned(), vec![mirror])),
+    };
+    &mut tables[i].1
+}
+
+/// Adds `mirror` to `registry`'s list, in order, once.
+fn add_mirror(tables: &mut Vec<(String, Table)>, registry: &str, mirror: String) {
+    let t = table(tables, registry);
+    if !t.mirrors.contains(&mirror) {
+        t.mirrors.push(mirror);
     }
 }
 
 pub fn config(engine: &Engine) -> String {
-    // One table per registry: BuildKit refuses a buildkitd.toml that names
-    // one twice, and Kiri's own mirror and Settings' may both cover Hub.
-    let mut registries: Vec<(String, Vec<String>)> = Vec::new();
-    let mut http: Vec<String> = Vec::new();
+    let mut tables: Vec<(String, Table)> = Vec::new();
     if let Some(port) = LISTENING.get().copied().flatten() {
         let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
         let token = token();
@@ -172,28 +187,49 @@ pub fn config(engine: &Engine) -> String {
             }
         }
         for name in names {
-            add_mirror(&mut registries, &name, format!("{host}/{token}/{name}"));
+            add_mirror(&mut tables, &name, format!("{host}/{token}/{name}"));
         }
-        http.push(host);
+        table(&mut tables, &host).http = true;
     }
-    // Settings → Registry mirrors: Docker Hub only, as Docker's are. They
-    // come after Kiri's own mirror, which serves images built or loaded
-    // here and answers 404 for everything else.
-    for mirror in super::registry_mirrors::list() {
-        add_mirror(&mut registries, "docker.io", mirror.buildkit());
-        if mirror.is_local() && !http.contains(&mirror.host) {
-            http.push(mirror.host.clone());
-        }
-    }
+    registries(&mut tables, &super::daemon_json::current());
     let mut out = String::new();
-    for (registry, mirrors) in registries {
-        let list = mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
-        out.push_str(&format!("[registry.\"{registry}\"]\n  mirrors = [{list}]\n"));
-    }
-    for host in http {
-        out.push_str(&format!("[registry.\"{host}\"]\n  http = true\n"));
+    for (registry, t) in tables {
+        out.push_str(&format!("[registry.\"{registry}\"]\n"));
+        if !t.mirrors.is_empty() {
+            let list = t.mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
+            out.push_str(&format!("  mirrors = [{list}]\n"));
+        }
+        if t.http {
+            out.push_str("  http = true\n");
+        }
+        if t.insecure {
+            out.push_str("  insecure = true\n");
+        }
     }
     out
+}
+
+/// daemon.json's part of buildkitd.toml. Its Docker Hub mirrors come after
+/// Kiri's own mirror, which serves images built or loaded here and answers
+/// 404 for everything else; a plain-HTTP one is asked over HTTP. Each
+/// insecure host is `http` and `insecure`, as Docker sets them for its
+/// builder: BuildKit then tries HTTPS without checking the certificate,
+/// then HTTP. A network entry has no host to name, so builds reach only
+/// the hosts listed by name (BuildKit has no network form).
+fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig) {
+    for mirror in &c.mirrors {
+        add_mirror(tables, "docker.io", mirror.buildkit());
+        if mirror.http {
+            table(tables, &mirror.host).http = true;
+        }
+    }
+    for e in &c.insecure {
+        if let kiri_image::Insecure::Host(h) = e {
+            let t = table(tables, h);
+            t.http = true;
+            t.insecure = true;
+        }
+    }
 }
 
 fn serve(listener: TcpListener, engine: Weak<Engine>) {
@@ -300,6 +336,28 @@ fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// daemon.json's hosts merge into one table each, as BuildKit wants:
+    /// insecure ones are http and insecure, plain-HTTP mirrors http, and a
+    /// network (no host to name) adds nothing.
+    #[test]
+    fn daemon_json_registries_share_one_table_each() {
+        let c = kiri_image::RegistryConfig {
+            insecure: ["registry.lan:5000", "mirror.lan:5000", "10.0.0.0/8"].iter().map(|e| kiri_image::Insecure::parse(e).unwrap()).collect(),
+            mirrors: vec![kiri_image::Mirror::parse("http://mirror.lan:5000").unwrap(), kiri_image::Mirror::parse("https://m.example.com/docker.io").unwrap()],
+        };
+        let mut tables = Vec::new();
+        add_mirror(&mut tables, "docker.io", "198.19.248.254:1234/t/docker.io".into());
+        registries(&mut tables, &c);
+        let names: Vec<&str> = tables.iter().map(|(r, _)| r.as_str()).collect();
+        assert_eq!(names, ["docker.io", "mirror.lan:5000", "registry.lan:5000"]);
+        assert_eq!(tables[0].1.mirrors, ["198.19.248.254:1234/t/docker.io", "mirror.lan:5000", "m.example.com/docker.io"]);
+        assert_eq!(tables[1].1, Table { mirrors: vec![], http: true, insecure: true });
+        assert_eq!(tables[2].1, Table { mirrors: vec![], http: true, insecure: true });
+        let mut none = Vec::new();
+        registries(&mut none, &kiri_image::RegistryConfig::default());
+        assert!(none.is_empty());
+    }
 
     #[test]
     fn parses_mirror_paths() {

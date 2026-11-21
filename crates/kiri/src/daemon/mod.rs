@@ -7,6 +7,7 @@ pub mod access;
 mod api;
 mod binds;
 mod builder;
+mod daemon_json;
 pub mod dns;
 pub mod tls;
 pub mod proxy;
@@ -26,7 +27,6 @@ pub(crate) mod nfs;
 mod ops;
 pub(crate) mod ports;
 mod pulls;
-mod registry_mirrors;
 mod seccomp;
 mod seccomp_names;
 pub mod time;
@@ -149,7 +149,9 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     finder(&engine);
     kiri_image::set_proxy_source(proxy::for_registry);
     // Settings → Registry mirrors: Docker Hub pulls try these first.
-    kiri_image::set_mirror_source(registry_mirrors::list);
+    // daemon.json's insecure-registries and registry-mirrors, read again
+    // whenever the file changes.
+    kiri_image::set_config_source(daemon_json::current);
     // The managed BuildKit stops itself when builds have been idle a while.
     builder::watch(engine.clone());
     // A Kubernetes node the engine restarted gets its kubectl context.

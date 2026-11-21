@@ -303,6 +303,51 @@ $D restart -t 20 "$N" >/dev/null; up
 t ij-layers-kept-next-start "layers $IJ_LAYERS" "docker run --rm alpine:3.21 true; echo layers \$(ls /var/lib/kiri/layers | wc -l)"
 t ij-cleanup "done" "rm -f $ST/images.json.corrupt-*; echo done"
 t ij-warning-gone "[]" "docker info --format '{{json .Warnings}}'"
+# Docker's insecure-registries and registry-mirrors, in Kiri's own
+# ~/.kiri/daemon.json (#329, #611, #118). The registries serve one image
+# store, pushed to over plain HTTP on loopback: kiri-trusted.test:5055 is
+# the plain-HTTP registry at a name that isn't loopback, :5056 the same
+# store behind a password, kiri-other.test:5444 TLS with a self-signed
+# certificate. Unlisted, each is refused (and no password goes to it);
+# listed with `kiri registry insecure add`, pull, push, login and build
+# work, for those hosts only. A hand edit of daemon.json applies without a
+# restart. A Docker Hub image only a plain-HTTP mirror has pulls through the
+# mirror.
+$D exec "$N" sh -c 'grep -q kiri-trusted.test /etc/hosts || echo "$(hostname -i | cut -d" " -f1) kiri-trusted.test kiri-other.test" >> /etc/hosts'
+REGS="apk add -q openssl >/dev/null 2>&1; mkdir -p /tls; [ -f /tls/other.pem ] || openssl req -x509 -newkey rsa:2048 -nodes -days 3 -subj /CN=kiri-other.test -addext subjectAltName=DNS:kiri-other.test -keyout /tls/other.key -out /tls/other.pem 2>/dev/null; chmod 644 /tls/other.key
+docker rm -f kiri-reg-http kiri-reg-other >/dev/null 2>&1
+docker run -d --name kiri-reg-http -p 5055:5000 -v kiri-regdata:/var/lib/registry registry:2 >/dev/null
+docker run -d --name kiri-reg-other -p 5444:5000 -v kiri-regdata:/var/lib/registry -v /tls:/tls:ro -e REGISTRY_HTTP_TLS_CERTIFICATE=/tls/other.pem -e REGISTRY_HTTP_TLS_KEY=/tls/other.key registry:2 >/dev/null
+for i in \$(seq 60); do curl -s -o /dev/null localhost:5055/v2/ && break; sleep 0.25; done"
+t registry-setup "pushed" "$REGS; docker tag alpine:3.21 localhost:5055/team/alp:1 && docker push -q localhost:5055/team/alp:1 >/dev/null && docker rmi localhost:5055/team/alp:1 >/dev/null && echo pushed"
+RIP=$($D exec "$N" sh -c 'hostname -i | cut -d" " -f1')
+REGAUTH="apk add -q apache2-utils >/dev/null 2>&1; mkdir -p /regauth && htpasswd -Bbn kiriuser kiripass > /regauth/htpasswd
+docker rm -f kiri-reg-auth >/dev/null 2>&1; docker run -d --name kiri-reg-auth -p 5056:5000 -v kiri-regdata:/var/lib/registry -v /regauth:/auth:ro -e REGISTRY_AUTH=htpasswd -e REGISTRY_AUTH_HTPASSWD_REALM=kiri -e REGISTRY_AUTH_HTPASSWD_PATH=/auth/htpasswd registry:2 >/dev/null
+for i in \$(seq 60); do curl -s -o /dev/null localhost:5056/v2/ && break; sleep 0.25; done"
+PULLED="&& echo pulled || echo refused"
+t insecure-setup "ok" "$REGAUTH; rm -f /root/.kiri/daemon.json; docker tag alpine:3.21 localhost:5055/library/kiri-mirror-only:1 && docker push -q localhost:5055/library/kiri-mirror-only:1 >/dev/null && docker rmi localhost:5055/library/kiri-mirror-only:1 >/dev/null && echo ok"
+t insecure-http-unlisted-refused "refused" "docker pull kiri-trusted.test:5055/team/alp:1 >/dev/null 2>&1 $PULLED"
+t insecure-tls-unlisted-refused "refused" "docker pull kiri-other.test:5444/team/alp:1 >/dev/null 2>&1 $PULLED"
+t insecure-login-unlisted-refused "refused" "echo kiripass | docker login kiri-trusted.test:5056 -u kiriuser --password-stdin >/dev/null 2>&1 && echo signed in || echo refused"
+t insecure-cli-add "kiri-other.test:5444" "/opt/kiri/kiri registry insecure add kiri-trusted.test:5055 kiri-trusted.test:5056 kiri-other.test:5444 $RIP:5055 2>&1"
+t insecure-cli-refuses-everything "every address" "/opt/kiri/kiri registry insecure add 0.0.0.0/0 2>&1"
+t insecure-daemon-json "kiri-trusted.test:5056" "cat /root/.kiri/daemon.json"
+t insecure-http-pull "Downloaded newer image" "docker pull kiri-trusted.test:5055/team/alp:1 2>&1"
+t insecure-http-push "pushed" "docker tag alpine:3.21 kiri-trusted.test:5055/team/pushed:1 && docker push kiri-trusted.test:5055/team/pushed:1 >/dev/null 2>&1 && curl -s localhost:5055/v2/team/pushed/tags/list | grep -q '\"1\"' && echo pushed"
+t insecure-selfsigned-pull "Downloaded newer image" "docker pull kiri-other.test:5444/team/alp:1 2>&1"
+t insecure-http-login "Login Succeeded" "echo kiripass | docker login kiri-trusted.test:5056 -u kiriuser --password-stdin 2>&1"
+t insecure-http-auth-pull "Downloaded newer image" "docker pull kiri-trusted.test:5056/team/alp:1 2>&1"
+t insecure-other-port-still-refused "refused" "docker pull kiri-trusted.test:5057/team/alp:1 >/dev/null 2>&1 $PULLED"
+t insecure-docker-info "kiri-trusted.test:5055" "docker info 2>/dev/null | sed -n '/Insecure Registries/,/^ [A-Z]/p'"
+t insecure-build "erucesni-tliub" "mkdir -p /bins && printf 'FROM $RIP:5055/team/alp:1\\nRUN echo built-insecure | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins 2>&1 | grep -m1 -o erucesni-tliub"
+t insecure-cli-remove "kiri-trusted.test:5056" "/opt/kiri/kiri registry insecure remove kiri-trusted.test:5055 kiri-other.test:5444 2>&1"
+t insecure-removed-refused "refused" "docker rmi kiri-other.test:5444/team/alp:1 >/dev/null 2>&1; docker pull kiri-other.test:5444/team/alp:1 >/dev/null 2>&1 $PULLED"
+t insecure-hand-edit "Downloaded newer image" "printf '{\"insecure-registries\": [\"kiri-other.test:5444\"], \"debug\": true}\\n' > /root/.kiri/daemon.json; docker pull kiri-other.test:5444/team/alp:1 2>&1"
+t insecure-hand-edit-keeps-keys "kept" "/opt/kiri/kiri registry mirror add http://$RIP:5055 >/dev/null 2>&1; f=/root/.kiri/daemon.json; grep -q '\"debug\": true' \$f && grep -q 'http://$RIP:5055' \$f && grep -q kiri-other.test:5444 \$f && echo kept"
+t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
+t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
+t mirror-build "rorrim-tliub" "docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins 2>&1 | grep -m1 -o rorrim-tliub"
+t insecure-cleanup "done" "rm -f /root/.kiri/daemon.json; docker rm -f kiri-reg-auth kiri-reg-http kiri-reg-other >/dev/null 2>&1; echo done"
 # Docker on the same host (#247): its firewall makes iptables' FORWARD
 # policy drop, and a forwarded packet must pass every chain on the hook, so
 # Kiri's own table accepting it was not enough and containers had no

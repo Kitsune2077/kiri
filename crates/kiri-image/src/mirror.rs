@@ -1,8 +1,8 @@
-//! Pull-through mirrors of Docker Hub, as Settings → Registry mirrors
-//! stores them: a host (with an optional port) and, for mirrors that keep
-//! the upstream registry in the path (`mirror.example.com/docker.io`, say), a
-//! path prefix. As Docker's `registry-mirrors`, they apply to `docker.io`
-//! only: other registries are pulled from directly.
+//! Pull-through mirrors of Docker Hub, as daemon.json's `registry-mirrors`
+//! (Settings → Registries, `kiri registry mirror`) lists them: a host (with
+//! an optional port) and, for mirrors that keep the upstream registry in the
+//! path (`mirror.example.com/docker.io`, say), a path prefix. As Docker's,
+//! they apply to `docker.io` only: other registries are pulled from directly.
 
 use crate::reference::is_local;
 
@@ -11,15 +11,19 @@ use crate::reference::is_local;
 pub struct Mirror {
     pub host: String,
     pub prefix: Option<String>,
+    /// Written `http://`: asked over plain HTTP, as Docker asks such a
+    /// mirror. A mirror is never sent credentials, so none go in the clear.
+    pub http: bool,
 }
 
 impl Mirror {
     /// Parses what a person types in Settings or passes to
-    /// `kiri registry-mirror add`: `mirror.example.com`, `https://mirror.example.com`,
-    /// `https://mirror.example.com/docker.io`, `127.0.0.1:5000`.
+    /// `kiri registry mirror add`: `mirror.example.com`, `https://mirror.example.com`,
+    /// `https://mirror.example.com/docker.io`, `http://mirror.lan:5000`.
     ///
-    /// A mirror is HTTPS, as Docker's are; a loopback one is plain HTTP, as
-    /// every local registry is. A trailing `/v2` is not part of the address.
+    /// A mirror is HTTPS unless it is written `http://`, as with Docker; a
+    /// loopback one is plain HTTP, as every local registry is. A trailing
+    /// `/v2` is not part of the address.
     pub fn parse(input: &str) -> Result<Mirror, String> {
         let text = input.trim();
         if text.is_empty() {
@@ -36,8 +40,11 @@ impl Mirror {
         if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-[]:_".contains(&b)) {
             return Err(format!("not a host name: {host}"));
         }
-        if scheme != "https" && !(scheme == "http" && is_local(&host)) {
-            return Err(format!("a mirror must be https (a local one may be http): {text}"));
+        if scheme != "https" && scheme != "http" {
+            return Err(format!("a mirror is an http or https address: {text}"));
+        }
+        if uri.query().is_some() || text.contains('#') {
+            return Err(format!("a mirror address has no query or fragment: {text}"));
         }
         // Both `https://host` and `https://host/v2` name the same service.
         let path = uri.path().trim_matches('/');
@@ -46,12 +53,13 @@ impl Mirror {
         if !path.is_empty() && !path.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_/".contains(&b)) {
             return Err(format!("not a mirror path: {path}"));
         }
-        Ok(Mirror { host, prefix: (!path.is_empty()).then(|| path.to_owned()) })
+        Ok(Mirror { http: scheme == "http" || is_local(&host), host, prefix: (!path.is_empty()).then(|| path.to_owned()) })
     }
 
-    /// What Settings shows and `kiri registry-mirror list` prints.
+    /// What Settings shows, `kiri registry mirror` prints and daemon.json
+    /// keeps.
     pub fn as_url(&self) -> String {
-        let scheme = if self.is_local() { "http" } else { "https" };
+        let scheme = if self.http { "http" } else { "https" };
         match &self.prefix {
             Some(prefix) => format!("{scheme}://{}/{prefix}", self.host),
             None => format!("{scheme}://{}", self.host),
@@ -89,11 +97,15 @@ mod tests {
         assert_eq!(Mirror::parse("127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
         assert_eq!(Mirror::parse("https://127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
         assert_eq!(Mirror::parse("https://mirror.example.net/docker.io").unwrap().buildkit(), "mirror.example.net/docker.io");
+        // Docker asks a mirror written http:// over plain HTTP; so does Kiri.
+        let plain = Mirror::parse("http://Mirror.Lan:5000/").unwrap();
+        assert_eq!((plain.host.as_str(), plain.http, plain.as_url().as_str()), ("mirror.lan:5000", true, "http://mirror.lan:5000"));
+        assert!(!Mirror::parse("mirror.lan:5000").unwrap().http);
     }
 
     #[test]
     fn refuses_what_is_not_a_mirror() {
-        for bad in ["", "   ", "https://", "ftp://mirror.example.com", "http://mirror.example.com", "https://user:pw@mirror.example.com", "https://mirror.example.com/a b"] {
+        for bad in ["", "   ", "https://", "ftp://mirror.example.com", "https://user:pw@mirror.example.com", "https://mirror.example.com/a b", "https://mirror.example.com/?x=1", "https://mirror.example.com/#x"] {
             assert!(Mirror::parse(bad).is_err(), "{bad:?} should be refused");
         }
     }
