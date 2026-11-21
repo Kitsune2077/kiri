@@ -73,6 +73,9 @@ t("saving one list keeps what is typed into the other", () => {
   if (!save("mirrors") || save("mirrors").disabled) throw new Error("mirror Save no longer offered");
   if (!save("insecure").disabled) throw new Error("saved list still shows changes");
   if (JSON.stringify(rows("insecure")) !== JSON.stringify(["registry.lan:5000", "other.lan:5000"])) throw new Error("rows " + rows("insecure"));
+  // Saved too, so the next check starts clean.
+  save("mirrors").click();
+  kiri.on(cfg(["registry.lan:5000", "other.lan:5000"], ["https://mirror.example.com", "https://second.example.com"]));
 });
 t("a save the daemon refused keeps what was typed", () => {
   kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
@@ -83,6 +86,8 @@ t("a save the daemon refused keeps what was typed", () => {
   // The error notice comes with the file as it was.
   kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
   if (JSON.stringify(rows("insecure")) !== JSON.stringify(["registry.lan:5000", "bad host"])) throw new Error("edit erased: " + rows("insecure"));
+  // Taken out again, as a person would, so the next check starts clean.
+  document.querySelector('#content [data-regdel="insecure:1"]').click();
   kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
 });
 t("the daemon's answer resets the page to what was saved", () => {
