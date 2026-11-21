@@ -468,6 +468,16 @@ fn joined(from: &str, location: &str) -> String {
     }
 }
 
+/// Where a response finally came from, set on those [`Client::get_following`]
+/// followed itself (ureq records it for the ones it followed).
+#[derive(Clone)]
+struct FinalUrl(String);
+
+fn final_url(resp: &ureq::http::Response<ureq::Body>) -> Option<String> {
+    use ureq::ResponseExt;
+    resp.extensions().get::<FinalUrl>().map(|f| f.0.clone()).or_else(|| Some(resp.get_uri().to_string()))
+}
+
 /// The scheme, host and port a URL names (the default port of its scheme if
 /// it has none): what must all match for a request to stay "the same place".
 fn origin_of(url: &str) -> Option<(bool, String, u16)> {
@@ -1275,7 +1285,11 @@ impl Client {
             let resp = req.call()?;
             let redirect = matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) && agent.config().max_redirects() == 0;
             let location = redirect.then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_owned)).flatten();
-            let Some(location) = location else { return Ok(resp) };
+            let Some(location) = location else {
+                let mut resp = resp;
+                resp.extensions_mut().insert(FinalUrl(url));
+                return Ok(resp);
+            };
             drain(resp);
             (url, keep_auth) = self.hop(owner, &origin, &url, &location, keep_auth)?;
         }
@@ -1292,13 +1306,19 @@ impl Client {
         call: impl Fn(Option<&str>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error>,
     ) -> Result<ureq::http::Response<ureq::Body>, Error> {
         let key = self.token_key(r, actions);
+        let registry_base = self.base(r.api_host());
         let mut resp = None;
         for attempt in 0..2 {
             let header = Self::cached_token(&key).or_else(|| {
                 self.credentials.as_ref().filter(|c| !c.registry_token.is_empty()).map(|c| format!("Bearer {}", c.registry_token))
             });
             let rsp = call(header.as_deref())?;
-            if rsp.status().as_u16() == 401 && attempt == 0 {
+            // A 401 from anywhere but the registry's own origin (a storage
+            // host a redirect or an upload address named) is not the
+            // registry asking: its challenge is not answered with the
+            // registry's credentials.
+            let own = final_url(&rsp).and_then(|u| origin_of(&u)).is_none_or(|o| Some(o) == origin_of(&registry_base));
+            if rsp.status().as_u16() == 401 && attempt == 0 && own {
                 let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 drain(rsp);
                 let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry).map_err(|e| match e {
@@ -2701,6 +2721,81 @@ mod tests {
         assert!(b_heads.contains("put /elsewhere"), "{b_heads}");
         assert!(!b_heads.contains("authorization"), "{b_heads}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn me() -> Option<Credentials> {
+        Some(Credentials { username: "me".into(), password: "secret".into(), ..Default::default() })
+    }
+
+    /// A host that is not the registry answers 401 and names a token service
+    /// of its own: the registry's credentials do not go there.
+    const CHALLENGE: &str = "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://EVIL/token\",service=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+
+    #[test]
+    fn an_upload_host_that_challenges_is_not_given_the_credentials() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-push-challenge-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let mut w = store.ingest().unwrap();
+        w.write_all(b"\x1f\x8bnot really gzip").unwrap();
+        let (layer, size) = w.finish().unwrap();
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let (cfg, _) = w.finish().unwrap();
+        let image = crate::archive::from_config("up:1".into(), &cfg, &config, vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        let evil_host = Arc::new(Mutex::new(String::new()));
+        let h = evil_host.clone();
+        let (evil, evil_seen) = recording_server(move |head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into()
+            } else {
+                CHALLENGE.replace("EVIL", &h.lock().unwrap())
+            }
+        });
+        *evil_host.lock().unwrap() = evil.clone();
+        let (a, _) = recording_server(move |head| {
+            if head.starts_with("GET /v2/ ") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()
+            } else if head.starts_with("HEAD") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else if head.starts_with("POST") {
+                format!("HTTP/1.1 202 Accepted\r\nLocation: http://{evil}/upload\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            }
+        });
+        let c = test_client().with_credentials(me());
+        let pushed = c.push(&store, &image, &Reference::parse(&format!("{a}/t:1")).unwrap(), &|_| {});
+        assert!(pushed.is_err(), "the upload host refused");
+        let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("put /upload"), "{heads}");
+        assert!(!heads.contains("authorization"), "{heads}");
+        assert!(!heads.contains("account=me"), "{heads}");
+        assert!(!heads.contains("get /token"), "the challenge was not answered: {heads}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_redirect_target_that_challenges_is_not_given_the_credentials() {
+        let evil_host = Arc::new(Mutex::new(String::new()));
+        let h = evil_host.clone();
+        let (evil, evil_seen) = recording_server(move |head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into()
+            } else {
+                CHALLENGE.replace("EVIL", &h.lock().unwrap())
+            }
+        });
+        *evil_host.lock().unwrap() = evil.clone();
+        let (a, _) = recording_server(move |_| redirect(&format!("http://{evil}/blob")));
+        let c = test_client().with_credentials(me());
+        let r = Reference::parse(&format!("{a}/t/b:1")).unwrap();
+        assert!(c.get(&r, &format!("http://{a}/v2/t/blobs/sha256:x"), None).is_err());
+        let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /blob"), "{heads}");
+        assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
     }
 
     #[test]

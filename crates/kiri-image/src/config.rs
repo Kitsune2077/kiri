@@ -99,7 +99,8 @@ fn host_name(s: &str) -> &str {
     if let Some(rest) = s.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
     }
-    s.rsplit_once(':').map_or(s, |(h, _)| h)
+    // `registry-1.docker.io.` (a trailing dot) is the same name.
+    s.rsplit_once(':').map_or(s, |(h, _)| h).trim_end_matches('.')
 }
 
 /// A name's addresses, for a network entry. Asked of the system's resolver,
@@ -293,6 +294,11 @@ mod tests {
             assert_eq!(c.reach(hub, false), Reach::Https, "{hub}");
         }
         assert!(!RegistryConfig::default().is_insecure("10.1.1.1"));
+        // A trailing dot names the same host.
+        for hub in ["registry-1.docker.io.", "docker.io.", "index.docker.io.:443"] {
+            assert!(is_hub(hub), "{hub}");
+            assert!(!c.is_unverified(hub), "{hub}");
+        }
     }
 
     #[test]

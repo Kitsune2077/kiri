@@ -1466,6 +1466,8 @@ if [ -n "$HOSTIP" ]; then
   t mirror-docker-info "http://$HOSTIP:5056/" bash -c "$D info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
   "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
   $D rmi kiri-mirror-only:1 >/dev/null 2>&1; $D rm -f reg2 >/dev/null
+else
+  skip insecure-registries "this computer has no network address to reach the registry at"
 fi
 $D rmi localhost:5055/team/alp:2 >/dev/null 2>&1; $D rm -f reg >/dev/null; rm -rf "$REG"
 

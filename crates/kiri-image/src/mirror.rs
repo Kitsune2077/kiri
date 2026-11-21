@@ -113,7 +113,7 @@ mod tests {
 
     #[test]
     fn docker_hub_is_not_a_mirror() {
-        for hub in ["docker.io", "http://docker.io", "https://docker.io", "http://index.docker.io", "http://registry-1.docker.io", "https://registry-1.docker.io:443/x"] {
+        for hub in ["docker.io", "http://docker.io", "https://docker.io", "http://index.docker.io", "http://registry-1.docker.io", "https://registry-1.docker.io:443/x", "http://registry-1.docker.io.", "https://docker.io."] {
             assert!(Mirror::parse(hub).is_err(), "{hub}");
         }
     }
