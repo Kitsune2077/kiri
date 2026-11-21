@@ -1287,7 +1287,11 @@ impl Client {
             let location = redirect.then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_owned)).flatten();
             let Some(location) = location else {
                 let mut resp = resp;
-                resp.extensions_mut().insert(FinalUrl(url));
+                // Only for hops followed here: a verified agent that followed
+                // redirects itself knows where it ended up (ureq records it).
+                if agent.config().max_redirects() == 0 {
+                    resp.extensions_mut().insert(FinalUrl(url));
+                }
                 return Ok(resp);
             };
             drain(resp);
@@ -1317,7 +1321,7 @@ impl Client {
             // host a redirect or an upload address named) is not the
             // registry asking: its challenge is not answered with the
             // registry's credentials.
-            let own = final_url(&rsp).and_then(|u| origin_of(&u)).is_none_or(|o| Some(o) == origin_of(&registry_base));
+            let own = final_url(&rsp).and_then(|u| origin_of(&u)).is_some_and(|o| Some(o) == origin_of(&registry_base));
             if rsp.status().as_u16() == 401 && attempt == 0 && own {
                 let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 drain(rsp);
@@ -1497,6 +1501,11 @@ impl Client {
         let resp = self.get_following(&url, host, None, &[], &[])?;
         match resp.status().as_u16() {
             200 => Ok(()),
+            // A 401 from another origin (a redirect off the registry) is not
+            // the registry asking: its challenge gets no credentials.
+            401 if final_url(&resp).and_then(|u| origin_of(&u)) != origin_of(&url) => {
+                Err(Error::Status { url, status: 401, body: "unauthorized: the registry sent the request elsewhere".into() })
+            }
             401 => {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
@@ -2775,6 +2784,30 @@ mod tests {
         assert!(!heads.contains("account=me"), "{heads}");
         assert!(!heads.contains("get /token"), "the challenge was not answered: {heads}");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_login_redirected_off_the_registry_sends_no_credentials() {
+        let evil_host = Arc::new(Mutex::new(String::new()));
+        let h = evil_host.clone();
+        let (evil, evil_seen) = recording_server(move |head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into()
+            } else {
+                CHALLENGE.replace("EVIL", &h.lock().unwrap())
+            }
+        });
+        *evil_host.lock().unwrap() = evil.clone();
+        // The first request is the scheme probe; the login after it is sent away.
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let (a, _) = recording_server(move |_| {
+            if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into() } else { redirect(&format!("http://{evil}/v2/")) }
+        });
+        let c = test_client().with_credentials(me());
+        assert!(c.login(&a).is_err());
+        let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /v2/"), "{heads}");
+        assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
     }
 
     #[test]
