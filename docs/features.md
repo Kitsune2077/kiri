@@ -55,7 +55,17 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   HTTP: HTTPS without checking the certificate first, then HTTP) and
   `registry-mirrors` (Docker Hub pull-through mirrors, tried in order).
   They apply to `pull`, `push`, `login` and `build`, only for the hosts
-  listed, and an edit applies without a restart. Settings → Registries and
+  listed, and an edit applies without a restart. Docker Hub is always
+  reached directly over verified HTTPS, whatever the file lists or its
+  name resolves to, and a registry on this machine (loopback) is tried
+  over HTTPS without a certificate check, then HTTP, as in Docker. A
+  registry in the list may name its own host or another listed host for
+  its token service, blob storage and uploads; a network entry alone
+  never lets a registry send credentials elsewhere. A name that
+  resolves to several addresses is matched to a network when any of them
+  is in it, and the connection may use another, as in Docker. A
+  daemon.json larger than 256 KiB, or not a regular file, is ignored,
+  and at most 256 hosts and 16 mirrors are read. Settings → Registries and
   `kiri registry insecure|mirror add|remove` edit the same file; Docker
   Desktop's daemon.json is never read or changed. A registry with a
   self-signed certificate is reached only once it is listed, as with Docker

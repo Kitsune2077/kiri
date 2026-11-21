@@ -433,19 +433,48 @@ fn is_https(url: &str) -> bool {
     url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
 }
 
-/// A redirect's `Location`, made absolute against the URL that sent it.
+/// Whether `s` starts with a URI scheme and `://` (RFC 3986: a letter, then
+/// letters, digits, `+`, `-` or `.`), as `https://host/x` does and
+/// `/blob?next=https://x` does not.
+fn has_scheme(s: &str) -> bool {
+    s.find("://").is_some_and(|i| {
+        let scheme = &s[..i];
+        scheme.chars().next().is_some_and(|c| c.is_ascii_alphabetic()) && scheme.bytes().all(|b| b.is_ascii_alphanumeric() || b"+-.".contains(&b))
+    })
+}
+
+/// A redirect's `Location`, made absolute against the URL that sent it
+/// (RFC 3986 section 5): an absolute URI stays, `//host/x` takes the scheme
+/// of `from`, `/x` its origin, `x` its directory; `from`'s own query and
+/// fragment are not part of that directory.
 fn joined(from: &str, location: &str) -> String {
-    if location.contains("://") {
+    if has_scheme(location) {
         return location.to_owned();
     }
+    let from = from.split(['?', '#']).next().unwrap_or(from);
     let origin_end = from.find("://").map_or(0, |i| i + 3);
+    let scheme = &from[..origin_end];
+    if let Some(rest) = location.strip_prefix("//") {
+        return format!("{scheme}{rest}");
+    }
     let origin = &from[..from[origin_end..].find('/').map_or(from.len(), |i| origin_end + i)];
     if location.starts_with('/') {
         format!("{origin}{location}")
+    } else if location.starts_with('?') {
+        format!("{from}{location}")
     } else {
         let dir = &from[..from.rfind('/').filter(|&i| i >= origin.len()).map_or(from.len(), |i| i + 1)];
         if dir.len() == from.len() { format!("{origin}/{location}") } else { format!("{dir}{location}") }
     }
+}
+
+/// The scheme, host and port a URL names (the default port of its scheme if
+/// it has none): what must all match for a request to stay "the same place".
+fn origin_of(url: &str) -> Option<(bool, String, u16)> {
+    let uri: ureq::http::Uri = url.parse().ok()?;
+    let https = uri.scheme_str()?.eq_ignore_ascii_case("https");
+    let host = uri.host()?.to_ascii_lowercase();
+    Some((https, host, uri.port_u16().unwrap_or(if https { 443 } else { 80 })))
 }
 
 /// How long an idle connection waits in the pool for the next request.
@@ -680,19 +709,43 @@ impl Client {
         format!("{scheme}://{host}")
     }
 
-    /// The agent for a request to `url`: the one that leaves the
-    /// certificate unchecked only for HTTPS to an `insecure-registries`
-    /// host. Everything else, a redirect away from such a host included,
-    /// is verified.
+    /// The agent for a request to `url`, a registry's own address: the one
+    /// that leaves the certificate unchecked only for HTTPS to a registry on
+    /// this machine or in `insecure-registries`. Everything else is verified.
     fn agent_for(&self, url: &str) -> ureq::Agent {
-        if !self.config.insecure.is_empty() && is_https(url) && url_host(url).is_some_and(|h| self.config.is_insecure(&h)) { insecure_agent() } else { self.agent.clone() }
+        match url_host(url) {
+            Some(host) if is_https(url) && self.config.is_unverified(&host) => insecure_agent(),
+            _ => self.agent.clone(),
+        }
+    }
+
+    /// Whether a request that `owner` (a registry's `host[:port]`) caused,
+    /// for its token service, a blob, an upload, may go to `host` without a
+    /// verified certificate or over plain HTTP: only when `owner` is itself
+    /// insecure (listed, or on this machine) and `host` is `owner`, a host
+    /// written in the list, or on this machine too. A network entry alone
+    /// does not make a host one an insecure registry may send people to.
+    fn unverified_ok(&self, host: &str, owner: &str) -> bool {
+        self.config.is_unverified(owner)
+            && !crate::config::is_hub(host)
+            && (host.eq_ignore_ascii_case(owner)
+                || self.config.is_listed_host(host)
+                || (crate::reference::is_local(owner) && crate::reference::is_local(host)))
+    }
+
+    /// The agent for a hop of a request that `owner` caused.
+    fn agent_for_hop(&self, url: &str, owner: &str) -> ureq::Agent {
+        match url_host(url) {
+            Some(host) if is_https(url) && self.unverified_ok(&host, owner) => insecure_agent(),
+            _ => self.agent.clone(),
+        }
     }
 
     /// Whether credentials may go to a token `realm` the registry named:
-    /// over HTTPS, or over plain HTTP to a loopback realm of a loopback
-    /// registry, or to a realm whose host `insecure-registries` lists (a
+    /// over HTTPS, or over plain HTTP to a realm of an insecure registry
+    /// that is the registry's own host or a host written in the list (a
     /// registry on plain HTTP names its own address for tokens). Never in
-    /// the clear to a host the user didn't list.
+    /// the clear to anywhere else, and never because of a network entry.
     fn realm_is_secure(&self, realm: &str, registry: &str) -> bool {
         if is_https(realm) {
             return true;
@@ -700,8 +753,7 @@ impl Client {
         if !realm.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
             return false;
         }
-        let Some(host) = url_host(realm) else { return false };
-        (crate::reference::is_local(registry) && crate::reference::is_local(&host)) || self.config.is_insecure(&host)
+        url_host(realm).is_some_and(|host| self.unverified_ok(&host, registry))
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -1159,14 +1211,12 @@ impl Client {
 
     /// GET `url` with `headers`, and `auth` as its `Authorization`. The
     /// verified agent follows redirects itself (without the header, ureq's
-    /// rule). The insecure one follows none, so they are followed here:
-    /// each hop on the agent its own host calls for, so a blob redirected
-    /// from a listed host to a storage server is fetched verified, and the
-    /// header only to the host first asked.
+    /// rule). The insecure one follows none, so [`Client::get_following`]
+    /// does, when a registry is on this machine or listed.
     fn send_get(&self, url: &str, auth: Option<&str>, headers: &[(&str, String)]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-        // Nothing listed (the usual case): one call on the shared agent, as
-        // before there was a list.
-        if self.config.insecure.is_empty() {
+        // Nothing listed and nothing on this machine over HTTPS (the usual
+        // case): one call on the shared agent, as before there was a list.
+        if self.config.insecure.is_empty() && !(is_https(url) && url_host(url).is_some_and(|h| crate::reference::is_local(&h))) {
             let mut req = self.agent.get(url);
             for (k, v) in headers {
                 req = req.header(*k, v);
@@ -1176,23 +1226,58 @@ impl Client {
             }
             return req.call();
         }
-        let first = url_host(url);
+        let owner = url_host(url).unwrap_or_default();
+        self.get_following(url, &owner, auth, headers, &[])
+    }
+
+    /// Where a redirect from `current` to `location` goes, and whether the
+    /// `Authorization` stays on the request. It stays only while every hop
+    /// has been the same origin (scheme, host and port) as `origin`: once a
+    /// request leaves it, the header is gone for good, bouncing back
+    /// included. A redirect from HTTPS to plain HTTP goes only to a host
+    /// `owner` may send people to without TLS ([`Client::unverified_ok`]).
+    fn hop(&self, owner: &str, origin: &str, current: &str, location: &str, keep_auth: bool) -> Result<(String, bool), ureq::Error> {
+        let next = joined(current, location);
+        let refuse = |why: &str| ureq::Error::Io(io::Error::other(format!("{current} redirects to {next}: {why}")));
+        if !(is_https(&next) || next.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))) {
+            return Err(refuse("not an http or https address"));
+        }
+        if is_https(current) && !is_https(&next) && !url_host(&next).is_some_and(|h| self.unverified_ok(&h, owner)) {
+            return Err(refuse("https to http, to a host not listed in insecure-registries"));
+        }
+        let same = origin_of(&next).is_some() && origin_of(&next) == origin_of(origin);
+        Ok((next, keep_auth && same))
+    }
+
+    /// GET `url` for a request that `owner` caused, following redirects by
+    /// hand where the agent follows none: each hop on the agent its own
+    /// host calls for (a blob redirected from a listed host to a storage
+    /// server is fetched verified), `auth` only to the origin first asked
+    /// (see [`Client::hop`]). `query` goes on the first request only.
+    fn get_following(&self, url: &str, owner: &str, auth: Option<&str>, headers: &[(&str, String)], query: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        let origin = url.to_owned();
         let mut url = url.to_owned();
-        for _ in 0..10 {
-            let agent = self.agent_for(&url);
+        let mut keep_auth = true;
+        for hop in 0..10 {
+            let agent = self.agent_for_hop(&url, owner);
             let mut req = agent.get(&url);
+            if hop == 0 {
+                for (k, v) in query {
+                    req = req.query(*k, *v);
+                }
+            }
             for (k, v) in headers {
                 req = req.header(*k, v);
             }
-            if let Some(a) = auth.filter(|_| url_host(&url) == first) {
+            if let Some(a) = auth.filter(|_| keep_auth) {
                 req = req.header("Authorization", a);
             }
             let resp = req.call()?;
             let redirect = matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) && agent.config().max_redirects() == 0;
-            let next = redirect.then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()).map(|l| joined(&url, l))).flatten();
-            let Some(next) = next else { return Ok(resp) };
+            let location = redirect.then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_owned)).flatten();
+            let Some(location) = location else { return Ok(resp) };
             drain(resp);
-            url = next;
+            (url, keep_auth) = self.hop(owner, &origin, &url, &location, keep_auth)?;
         }
         Err(ureq::Error::TooManyRedirects)
     }
@@ -1269,23 +1354,24 @@ impl Client {
             if let Some(s) = scope {
                 form.push(("scope", s));
             }
-            self.agent_for(realm).post(realm.as_str()).send_form(form)?
+            self.agent_for_hop(realm, registry).post(realm.as_str()).send_form(form)?
         } else {
-            let agent = self.agent_for(realm);
-            let mut req = agent.get(realm.as_str());
+            let mut query: Vec<(&str, &str)> = Vec::new();
             if let Some(s) = scope {
-                req = req.query("scope", s);
+                query.push(("scope", s));
             }
             if !service.is_empty() {
-                req = req.query("service", service);
+                query.push(("service", service));
             }
+            let mut auth = None;
             if let Some(c) = creds {
-                req = req.query("account", &c.username);
-                if let Some(b) = c.basic() {
-                    req = req.header("Authorization", &b);
-                }
+                query.push(("account", &c.username));
+                auth = c.basic();
             }
-            req.call()?
+            // Redirects (an insecure token service may redirect) are followed
+            // by the same helper as a registry's own, so credentials stay
+            // with the realm's origin.
+            self.get_following(realm, registry, auth.as_deref(), &[], &query)?
         };
         let status = resp.status().as_u16();
         if status == 401 || status == 403 {
@@ -1388,15 +1474,14 @@ impl Client {
         let host = server.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default();
         let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" { "registry-1.docker.io" } else { host };
         let url = format!("{}/v2/", self.base(host));
-        let agent = self.agent_for(&url);
-        let resp = agent.get(&url).call()?;
+        let resp = self.get_following(&url, host, None, &[], &[])?;
         match resp.status().as_u16() {
             200 => Ok(()),
             401 => {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
                     let (auth, _) = self.answer(&challenge, "", host)?;
-                    let again = agent.get(&url).header("Authorization", &auth).call()?;
+                    let again = self.get_following(&url, host, Some(&auth), &[], &[])?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
                         s => Err(Error::Status { url, status: s, body: "unauthorized: incorrect username or password".into() }),
@@ -1445,13 +1530,21 @@ impl Client {
             })?;
             let started = ok(started, &start_url)?;
             let location = started.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
-            let location = if location.starts_with('/') { format!("{base}{location}") } else { location };
+            let location = joined(&start_url, &location);
             let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
+            // The registry's credentials go to the upload address only when
+            // it is the registry's own origin; another host gets the blob and
+            // none, and plain HTTP only where `insecure-registries` allows it.
+            let own_origin = origin_of(&put_url).is_some() && origin_of(&put_url) == origin_of(&start_url);
+            let owner = url_host(&start_url).unwrap_or_default();
+            if !own_origin && is_https(&start_url) && !is_https(&put_url) && !url_host(&put_url).is_some_and(|h| self.unverified_ok(&h, &owner)) {
+                return Err(Error::Http(format!("{start_url} sent the upload to {put_url}: https to http, to a host not listed in insecure-registries")));
+            }
             let path = store.blob_path(digest)?;
             let put = self.authed(target, "pull,push", |auth| {
                 let mut f = std::fs::File::open(&path).map_err(ureq::Error::Io)?;
-                let mut req = self.agent_for(&put_url).put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
-                if let Some(a) = auth {
+                let mut req = self.agent_for_hop(&put_url, &owner).put(&put_url).header("Content-Type", "application/octet-stream").header("Content-Length", &size.to_string());
+                if let Some(a) = auth.filter(|_| own_origin) {
                     req = req.header("Authorization", a);
                 }
                 req.send(ureq::SendBody::from_reader(&mut f))
@@ -1797,6 +1890,11 @@ mod tests {
         std::thread::spawn(move || {
             for c in listener.incoming() {
                 let Ok(mut c) = c else { break };
+                let mut first = [0u8; 1];
+                if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                    let _ = c.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
                 let mut head = Vec::new();
                 let mut b = [0u8; 1];
                 while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
@@ -1804,6 +1902,11 @@ mod tests {
                 }
                 let line = String::from_utf8_lossy(&head).lines().next().unwrap_or_default().to_owned();
                 let path = line.split(' ').nth(1).unwrap_or_default().to_owned();
+                // The scheme probe a loopback registry gets: answered, not counted.
+                if path == "/v2/" {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
                 seen.lock().unwrap().push(path.clone());
                 let (status, ct, body) = answer(&path);
                 let _ = write!(c, "HTTP/1.1 {status} X\r\nContent-Type: {ct}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
@@ -1983,6 +2086,11 @@ mod tests {
                 if head.starts_with("quit") || head.is_empty() {
                     break;
                 }
+                // The scheme probe a loopback registry gets: answered, not counted.
+                if head.starts_with("get /v2/ ") {
+                    let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                    continue;
+                }
                 let from = head.lines().find_map(|l| l.strip_prefix("range: bytes=")).and_then(|r| r.trim_end_matches('-').parse().ok()).unwrap_or(0);
                 seen.push(from);
                 // Each on its own, so a stalled answer does not hold up the next.
@@ -2012,7 +2120,14 @@ mod tests {
         let served = std::thread::spawn(move || {
             let mut blobs = HashMap::new();
             'conns: for c in listener.incoming() {
-                let mut c = std::io::BufReader::new(c.unwrap());
+                let c = c.unwrap();
+                // A TLS handshake on this plain-HTTP port is refused at once.
+                let mut first = [0u8; 1];
+                if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                    let _ = std::io::Write::write_all(&mut &c, b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
+                let mut c = std::io::BufReader::new(c);
                 loop {
                     let mut head = String::new();
                     let mut line = String::new();
@@ -2031,6 +2146,12 @@ mod tests {
                     let mut body = vec![0u8; len];
                     std::io::Read::read_exact(&mut c, &mut body).unwrap();
                     let path = first.split(' ').nth(1).unwrap_or_default().to_owned();
+                    // The scheme probe goes through another agent: its
+                    // connection ends here, so the next one is served.
+                    if first.starts_with("GET /v2/ ") {
+                        let _ = std::io::Write::write_all(c.get_mut(), b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+                        continue 'conns;
+                    }
                     let reply = if first.starts_with("HEAD") {
                         "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
                     } else if first.starts_with("POST") {
@@ -2178,6 +2299,9 @@ mod tests {
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
         let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true };
+        // A loopback registry's scheme is asked once (HTTPS, then HTTP):
+        // done before the clock for the cancel starts.
+        let _ = client.base(&host);
         let cancel = Cancel::new();
         let c = cancel.clone();
         std::thread::spawn(move || {
@@ -2360,6 +2484,256 @@ mod tests {
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "/storage/x"), "https://r.lan:5000/storage/x");
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "y"), "https://r.lan:5000/v2/a/blobs/y");
         assert_eq!(joined("https://r.lan:5000", "y"), "https://r.lan:5000/y");
+        // A scheme is letters before `://`, not any `://` in the text.
+        assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "/blob?next=https://evil.example/x"), "https://r.lan:5000/blob?next=https://evil.example/x");
+        assert_eq!(joined("https://r.lan:5000/v2/a", "ftp://files.example/x"), "ftp://files.example/x");
+        // `//host/x` keeps the scheme and takes the host.
+        assert_eq!(joined("https://r.lan:5000/v2/a", "//cdn.example.com/blob"), "https://cdn.example.com/blob");
+        assert_eq!(joined("http://r.lan/v2/a", "//cdn.example.com/blob"), "http://cdn.example.com/blob");
+        // `from`'s query is not part of its directory.
+        assert_eq!(joined("https://r.lan:5000/v2/a/up?next=/x/y", "z"), "https://r.lan:5000/v2/a/z");
+        assert_eq!(joined("https://r.lan:5000/v2/a/up?next=/x/y", "/z"), "https://r.lan:5000/z");
+        assert_eq!(joined("https://r.lan:5000?a=/b", "y"), "https://r.lan:5000/y");
+    }
+
+    fn listing(entries: &[&str]) -> Client {
+        test_client().with_config(RegistryConfig { insecure: entries.iter().map(|e| crate::config::Insecure::parse(e).unwrap()).collect(), ..Default::default() })
+    }
+
+    /// An unlisted registry names a listed host, or a host in a listed
+    /// network, as its token service: nothing goes there unverified or in the
+    /// clear, and a listed registry may name only itself or a listed host.
+    #[test]
+    fn an_unlisted_registry_cannot_send_credentials_to_a_listed_realm() {
+        let c = listing(&["auth.lan", "10.0.0.0/8"]);
+        for realm in ["http://auth.lan/token", "http://10.1.2.3/token", "http://127.0.0.1:5000/token"] {
+            assert!(!c.realm_is_secure(realm, "registry.example.com"), "{realm}");
+        }
+        for realm in ["https://auth.lan/token", "https://10.1.2.3/token"] {
+            assert!(!c.agent_for_hop(realm, "registry.example.com").config().tls_config().disable_verification(), "{realm}");
+        }
+        // A listed registry: itself and listed hosts, but not a host only a
+        // network covers.
+        let c = listing(&["registry.lan", "auth.lan", "10.0.0.0/8"]);
+        assert!(c.realm_is_secure("http://registry.lan/token", "registry.lan"));
+        assert!(c.realm_is_secure("http://auth.lan/token", "registry.lan"));
+        assert!(!c.realm_is_secure("http://10.1.2.3/token", "registry.lan"));
+        assert!(c.agent_for_hop("https://auth.lan/token", "registry.lan").config().tls_config().disable_verification());
+        assert!(!c.agent_for_hop("https://10.1.2.3/token", "registry.lan").config().tls_config().disable_verification());
+        // A registry the network covers may name itself.
+        assert!(c.realm_is_secure("http://10.1.2.4/token", "10.1.2.4"));
+        assert!(!c.realm_is_secure("http://10.1.2.5/token", "10.1.2.4"));
+    }
+
+    /// The same, end to end: the token service is a plain-HTTP server a
+    /// listed host, and the registry that names it is not listed.
+    #[test]
+    fn an_unlisted_registrys_token_request_carries_no_credentials() {
+        let (realm_host, seen) = recording_server(|_| "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into());
+        let c = listing(&["127.0.0.0/8"]).with_credentials(Some(Credentials { username: "me".into(), password: "secret".into(), ..Default::default() }));
+        let params = HashMap::from([("realm".to_owned(), format!("http://{realm_host}/token")), ("service".to_owned(), "r".to_owned())]);
+        let (token, _) = c.token(&params, Some("repository:a:pull"), "registry.example.com").unwrap();
+        assert_eq!(token, "t");
+        let heads = seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /token"), "{heads}");
+        assert!(!heads.contains("authorization"), "{heads}");
+        assert!(!heads.contains("account=me"), "{heads}");
+    }
+
+    /// A server on loopback that records each request's head and answers it
+    /// with `reply(head)`; plain HTTP, or TLS with a throwaway certificate.
+    fn recording_server(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_recording(false, reply)
+    }
+
+    fn tls_recording_server(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
+        serve_recording(true, reply)
+    }
+
+    fn serve_recording(tls: bool, reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
+        let config = tls.then(|| {
+            let key = rcgen::KeyPair::generate().unwrap();
+            let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap().self_signed(&key).unwrap();
+            let provider = Arc::new(rustls::crypto::ring::default_provider());
+            Arc::new(
+                rustls::ServerConfig::builder_with_provider(provider)
+                    .with_safe_default_protocol_versions()
+                    .unwrap()
+                    .with_no_client_auth()
+                    .with_single_cert(vec![cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into())
+                    .unwrap(),
+            )
+        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        std::thread::spawn(move || {
+            for sock in listener.incoming().flatten() {
+                let (log, reply, config) = (log.clone(), reply.clone(), config.clone());
+                std::thread::spawn(move || {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                    // A TLS handshake on a plain-HTTP port is refused at once.
+                    let mut first = [0u8; 1];
+                    if config.is_none() && sock.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                        let _ = (&sock).write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                        return;
+                    }
+                    let mut stream: Box<dyn ReadWrite> = match config {
+                        Some(c) => match rustls::ServerConnection::new(c) {
+                            Ok(conn) => Box::new(rustls::StreamOwned::new(conn, sock)),
+                            Err(_) => return,
+                        },
+                        None => Box::new(sock),
+                    };
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut b).unwrap_or(0) == 1 {
+                        head.push(b[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    if head.is_empty() {
+                        return;
+                    }
+                    log.lock().unwrap().push(head.clone());
+                    let _ = stream.write_all(reply(&head).as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (host, seen)
+    }
+
+    trait ReadWrite: Read + Write + Send {}
+    impl<T: Read + Write + Send> ReadWrite for T {}
+
+    fn redirect(to: &str) -> String {
+        format!("HTTP/1.1 302 Found\r\nLocation: {to}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+    }
+
+    const OK: &str = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok";
+
+    fn with_auth(seen: &Arc<Mutex<Vec<String>>>) -> Vec<bool> {
+        seen.lock().unwrap().iter().map(|h| h.to_ascii_lowercase().contains("\nauthorization: basic c2vjcmv0")).collect()
+    }
+
+    #[test]
+    fn a_redirect_off_the_https_origin_to_plain_http_loses_the_credentials() {
+        let (plain, plain_seen) = recording_server(|_| OK.into());
+        let target = format!("http://{plain}/stolen");
+        let (https, https_seen) = tls_recording_server(move |_| redirect(&target));
+        let c = listing(&["127.0.0.0/8"]);
+        let resp = c.send_get(&format!("https://{https}/v2/x"), Some("Basic c2VjcmV0"), &[]).unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(with_auth(&https_seen), [true]);
+        assert_eq!(with_auth(&plain_seen), [false]);
+    }
+
+    #[test]
+    fn credentials_do_not_come_back_after_a_hop_to_another_origin() {
+        // A (https) -> B (https, another port) -> A again.
+        let (a_slot, b_slot) = (Arc::new(Mutex::new(String::new())), Arc::new(Mutex::new(String::new())));
+        let (a_to_b, b_to_a) = (b_slot.clone(), a_slot.clone());
+        let (a, a_seen) = tls_recording_server(move |head| if head.contains("/again") { OK.into() } else { redirect(&format!("https://{}/hop", a_to_b.lock().unwrap())) });
+        let (b, b_seen) = tls_recording_server(move |_| redirect(&format!("https://{}/again", b_to_a.lock().unwrap())));
+        *a_slot.lock().unwrap() = a.clone();
+        *b_slot.lock().unwrap() = b;
+        let c = listing(&["127.0.0.0/8"]);
+        let resp = c.send_get(&format!("https://{a}/v2/x"), Some("Basic c2VjcmV0"), &[]).unwrap();
+        assert_eq!(resp.status().as_u16(), 200);
+        assert_eq!(with_auth(&a_seen), [true, false]);
+        assert_eq!(with_auth(&b_seen), [false]);
+    }
+
+    /// The token service of a listed registry redirects (to a plain-HTTP
+    /// host the list allows): followed, and the credentials stay with the
+    /// origin that was asked.
+    #[test]
+    fn a_token_service_that_redirects_is_followed_without_the_credentials_leaving() {
+        let (b, b_seen) = recording_server(|_| "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into());
+        let target = format!("http://{b}/token2");
+        let (a, a_seen) = tls_recording_server(move |_| redirect(&target));
+        let c = listing(&[]).with_credentials(Some(Credentials { username: "me".into(), password: "secret".into(), ..Default::default() }));
+        let params = HashMap::from([("realm".to_owned(), format!("https://{a}/token")), ("service".to_owned(), "r".to_owned())]);
+        let (token, _) = c.token(&params, Some("repository:a:pull"), &a).unwrap();
+        assert_eq!(token, "t");
+        assert_eq!(a_seen.lock().unwrap().len(), 1);
+        let first = a_seen.lock().unwrap()[0].to_ascii_lowercase();
+        assert!(first.contains("authorization: basic") && first.contains("account=me"), "{first}");
+        let second = b_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(second.contains("get /token2"), "{second}");
+        assert!(!second.contains("authorization"), "{second}");
+    }
+
+    /// The upload address a registry names is sent the registry's credentials
+    /// only when it is the registry's own origin.
+    #[test]
+    fn an_upload_to_another_origin_carries_no_credentials() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-push-origin-test-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let mut w = store.ingest().unwrap();
+        w.write_all(b"\x1f\x8bnot really gzip").unwrap();
+        let (layer, size) = w.finish().unwrap();
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let (cfg, _) = w.finish().unwrap();
+        let image = crate::archive::from_config("up:1".into(), &cfg, &config, vec![Layer { digest: layer.clone(), size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        let (b, b_seen) = recording_server(|_| "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        let (a, a_seen) = recording_server(move |head| {
+            if head.starts_with("GET /v2/ ") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()
+            } else if head.starts_with("HEAD") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else if head.starts_with("POST") {
+                format!("HTTP/1.1 202 Accepted\r\nLocation: http://{b}/elsewhere\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            }
+        });
+        let c = test_client().with_credentials(Some(Credentials { registry_token: "tok".into(), ..Default::default() }));
+        c.push(&store, &image, &Reference::parse(&format!("{a}/t:1")).unwrap(), &|_| {}).unwrap();
+        let (a_heads, b_heads) = (a_seen.lock().unwrap().join("\n").to_ascii_lowercase(), b_seen.lock().unwrap().join("\n").to_ascii_lowercase());
+        assert!(a_heads.contains("authorization: bearer tok"), "the registry itself is sent them: {a_heads}");
+        assert!(b_heads.contains("put /elsewhere"), "{b_heads}");
+        assert!(!b_heads.contains("authorization"), "{b_heads}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_redirect_inside_the_origin_keeps_the_credentials() {
+        let (a, a_seen) = tls_recording_server(|head| if head.contains("/second") { OK.into() } else { redirect("/second") });
+        let c = listing(&["127.0.0.0/8"]);
+        c.send_get(&format!("https://{a}/v2/x"), Some("Basic c2VjcmV0"), &[]).unwrap();
+        assert_eq!(with_auth(&a_seen), [true, true]);
+    }
+
+    #[test]
+    fn https_to_http_goes_only_to_a_host_the_list_allows() {
+        let c = listing(&["registry.lan:5000", "plain.lan"]);
+        let origin = "https://registry.lan:5000/v2/x";
+        let go = |from: &str, to: &str| c.hop("registry.lan:5000", origin, from, to, true);
+        // Down to its own host or a listed one: yes, without the header.
+        assert_eq!(go(origin, "http://registry.lan:5000/v2/x").unwrap(), ("http://registry.lan:5000/v2/x".to_owned(), false));
+        assert!(go(origin, "http://plain.lan/x").is_ok());
+        // Down to a host nobody listed, or to a network-only host: no.
+        assert!(go(origin, "http://evil.example/x").is_err());
+        // `//host/x` keeps https: not a downgrade, and not the origin either.
+        assert_eq!(go(origin, "//evil.example/x").unwrap(), ("https://evil.example/x".to_owned(), false));
+        assert!(go(origin, "ftp://registry.lan/x").is_err());
+        // Up to https from a request already off the origin: the header stays gone.
+        assert!(!c.hop("registry.lan:5000", origin, "http://x.example/a", "https://registry.lan:5000/v2/x", false).unwrap().1);
+        // Same scheme, host and port: the header stays; another port: it goes.
+        assert!(go(origin, "/other").unwrap().1);
+        assert!(go(origin, "https://registry.lan:5000/other").unwrap().1);
+        assert!(!go(origin, "https://registry.lan:5001/other").unwrap().1);
+        // And once gone it stays gone.
+        assert!(!c.hop("registry.lan:5000", origin, "https://s3.example.com/x", "https://registry.lan:5000/y", false).unwrap().1);
+        let nets = listing(&["registry.lan:5000", "10.0.0.0/8"]);
+        assert!(nets.hop("registry.lan:5000", origin, origin, "http://10.1.2.3/x", true).is_err());
     }
 
     /// A registry that serves one image under any repository name: an index
@@ -2402,6 +2776,13 @@ mod tests {
                     continue;
                 };
                 c.set_nonblocking(false).unwrap();
+                // A TLS handshake on this plain-HTTP port is refused at once,
+                // as Go's and nginx's servers refuse it.
+                let mut first = [0u8; 1];
+                if c.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16 {
+                    let _ = c.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    continue;
+                }
                 let mut head = Vec::new();
                 let mut b = [0u8; 1];
                 while !head.ends_with(b"\r\n\r\n") && c.read(&mut b).unwrap_or(0) == 1 {
@@ -2418,7 +2799,10 @@ mod tests {
                 // A request that carried credentials is marked, so a test can
                 // tell what a mirror was sent.
                 let authed = head.to_ascii_lowercase().contains("\nauthorization:");
-                seen.push(if authed { format!("{path} (with credentials)") } else { path.clone() });
+                // The scheme probe a loopback registry gets is answered, not counted.
+                if path != "/v2/" {
+                    seen.push(if authed { format!("{path} (with credentials)") } else { path.clone() });
+                }
                 let (status, body, kind): (u16, Vec<u8>, &str) = if path == "/v2/" {
                     (200, b"{}".to_vec(), "application/json")
                 } else if let Some(reference) = path.split_once("/manifests/").map(|(_, r)| r) {

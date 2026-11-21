@@ -46,6 +46,7 @@ t("adding an insecure host, then Save, sends that list only", () => {
   sent.length = 0;
   save("insecure").click();
   if (JSON.stringify(sentSave()) !== JSON.stringify([{ "insecure-registries": ["registry.lan:5000"] }])) throw new Error("sent " + JSON.stringify(sent));
+  kiri.on(cfg(["registry.lan:5000"], []));
 });
 t("Enter in the field adds, as the button does", () => {
   put("reg-mirrors", "https://mirror.example.com");
@@ -54,6 +55,35 @@ t("Enter in the field adds, as the button does", () => {
   sent.length = 0;
   save("mirrors").click();
   if (JSON.stringify(sentSave()) !== JSON.stringify([{ "registry-mirrors": ["https://mirror.example.com"] }])) throw new Error("sent " + JSON.stringify(sent));
+  kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
+});
+t("saving one list keeps what is typed into the other", () => {
+  kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
+  open();
+  put("reg-mirrors", "https://second.example.com");
+  document.querySelector('#content [data-regadd="mirrors"]').click();
+  put("reg-insecure", "other.lan:5000");
+  document.querySelector('#content [data-regadd="insecure"]').click();
+  put("reg-insecure", "half-typed.lan");
+  sent.length = 0;
+  save("insecure").click();
+  // The daemon saved the insecure list.
+  kiri.on(cfg(["registry.lan:5000", "other.lan:5000"], ["https://mirror.example.com"]));
+  if (JSON.stringify(rows("mirrors")) !== JSON.stringify(["https://mirror.example.com", "https://second.example.com"])) throw new Error("mirror edits lost: " + rows("mirrors"));
+  if (!save("mirrors") || save("mirrors").disabled) throw new Error("mirror Save no longer offered");
+  if (!save("insecure").disabled) throw new Error("saved list still shows changes");
+  if (JSON.stringify(rows("insecure")) !== JSON.stringify(["registry.lan:5000", "other.lan:5000"])) throw new Error("rows " + rows("insecure"));
+});
+t("a save the daemon refused keeps what was typed", () => {
+  kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
+  open();
+  put("reg-insecure", "bad host");
+  document.querySelector('#content [data-regadd="insecure"]').click();
+  save("insecure").click();
+  // The error notice comes with the file as it was.
+  kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
+  if (JSON.stringify(rows("insecure")) !== JSON.stringify(["registry.lan:5000", "bad host"])) throw new Error("edit erased: " + rows("insecure"));
+  kiri.on(cfg(["registry.lan:5000"], ["https://mirror.example.com"]));
 });
 t("the daemon's answer resets the page to what was saved", () => {
   kiri.on(cfg(["registry.lan:5000", "10.0.0.0/8"], ["https://mirror.example.com"]));

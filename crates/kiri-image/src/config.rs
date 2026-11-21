@@ -51,8 +51,7 @@ impl Insecure {
         if !valid_host(bare) {
             return Err(format!("not a host or a network: {text}"));
         }
-        let name = host_name(bare);
-        if ["docker.io", "index.docker.io", "registry-1.docker.io"].contains(&name) {
+        if is_hub(bare) {
             return Err("Docker Hub is always reached over verified HTTPS".into());
         }
         Ok(Insecure::Host(bare.to_owned()))
@@ -86,6 +85,13 @@ fn valid_host(s: &str) -> bool {
         (h.split('.').all(label), p)
     };
     host_ok && port.is_none_or(|p| p.parse::<u16>().is_ok_and(|p| p > 0))
+}
+
+/// Docker Hub's names. Hub is always reached over verified HTTPS: no
+/// setting, and no address the name resolves to, changes that.
+pub fn is_hub(host: &str) -> bool {
+    let name = host_name(host);
+    ["docker.io", "index.docker.io", "registry-1.docker.io"].iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
 /// The host of `host[:port]` or `[v6]:port`, without the port.
@@ -137,10 +143,10 @@ fn mask(ip: IpAddr, bits: u8) -> IpAddr {
 pub enum Reach {
     /// Verified HTTPS: every registry nothing below covers.
     Https,
-    /// Plain HTTP: a registry on this machine (as Docker treats loopback),
-    /// or a mirror written `http://` when it is asked as the mirror.
+    /// Plain HTTP: a mirror written `http://` when it is asked as the mirror.
     Http,
-    /// Listed in `insecure-registries`: HTTPS without checking the
+    /// A registry on this machine (Docker treats loopback as insecure) or
+    /// listed in `insecure-registries`: HTTPS without checking the
     /// certificate, else plain HTTP.
     Insecure,
 }
@@ -158,9 +164,19 @@ impl RegistryConfig {
     /// listed in `insecure-registries`. A network entry covers an address
     /// in it, and a name whose address (looked up as a connection to it
     /// would be) is; names are only looked up when a network is listed.
+    /// Docker Hub never is, whatever its name resolves to, and with an empty
+    /// list nothing is looked up.
+    ///
+    /// A name resolving to several addresses is covered when any is in the
+    /// network, and the connection to it may then pick another: Docker
+    /// matches networks the same way, and the registries a network lists
+    /// are on the same LAN.
     pub fn is_insecure(&self, host: &str) -> bool {
+        if self.insecure.is_empty() || is_hub(host) {
+            return false;
+        }
         let host = host.to_ascii_lowercase();
-        if self.insecure.iter().any(|e| matches!(e, Insecure::Host(h) if *h == host)) {
+        if self.is_listed_host(&host) {
             return true;
         }
         if !self.insecure.iter().any(|e| matches!(e, Insecure::Net(..))) {
@@ -177,15 +193,36 @@ impl RegistryConfig {
         })
     }
 
-    /// How `host` is reached: loopback over plain HTTP, listed hosts
-    /// insecure, the rest over verified HTTPS. `as_mirror` is a pull of a
-    /// Docker Hub image from a mirror (never with credentials): a mirror
-    /// written `http://` is asked over plain HTTP then, as Docker asks it,
-    /// but the same host named as a registry is like any other.
+    /// Whether `host` is written in the list as a host (not reached by a
+    /// network): the only way a registry may name another host for its
+    /// token service or its blobs and have unchecked TLS or plain HTTP.
+    pub fn is_listed_host(&self, host: &str) -> bool {
+        if is_hub(host) {
+            return false;
+        }
+        let host = host.to_ascii_lowercase();
+        self.insecure.iter().any(|e| matches!(e, Insecure::Host(h) if *h == host))
+    }
+
+    /// Whether `host` may be reached without a verified certificate: a
+    /// registry on this machine, as Docker treats loopback, or one in the
+    /// list. Docker Hub never.
+    pub fn is_unverified(&self, host: &str) -> bool {
+        !is_hub(host) && (is_local(host) || self.is_insecure(host))
+    }
+
+    /// How `host` is reached: Docker Hub always verified, loopback and listed
+    /// hosts insecure (HTTPS unchecked, else plain HTTP, as Docker does),
+    /// the rest over verified HTTPS. `as_mirror` is a pull of a Docker Hub
+    /// image from a mirror (never with credentials): a mirror written
+    /// `http://` is asked over plain HTTP then, as Docker asks it, but the
+    /// same host named as a registry is like any other.
     pub fn reach(&self, host: &str, as_mirror: bool) -> Reach {
-        if is_local(host) || (as_mirror && self.mirrors.iter().any(|m| m.http && m.host == host)) {
+        if is_hub(host) {
+            Reach::Https
+        } else if as_mirror && self.mirrors.iter().any(|m| m.http && m.host == host) {
             Reach::Http
-        } else if self.is_insecure(host) {
+        } else if self.is_unverified(host) {
             Reach::Insecure
         } else {
             Reach::Https
@@ -246,11 +283,32 @@ mod tests {
     }
 
     #[test]
+    fn docker_hub_is_never_insecure_whatever_it_resolves_to() {
+        // 127.0.0.0/8 is where the hub names would resolve with a hosts-file
+        // entry; the network must not cover them.
+        let c = cfg(&["10.0.0.0/8", "127.0.0.0/8", "192.168.0.0/16"]);
+        for hub in ["docker.io", "index.docker.io", "registry-1.docker.io", "registry-1.docker.io:443", "REGISTRY-1.docker.io"] {
+            assert!(!c.is_insecure(hub), "{hub}");
+            assert!(!c.is_unverified(hub), "{hub}");
+            assert_eq!(c.reach(hub, false), Reach::Https, "{hub}");
+        }
+        assert!(!RegistryConfig::default().is_insecure("10.1.1.1"));
+    }
+
+    #[test]
+    fn a_network_alone_is_not_a_listed_host() {
+        let c = cfg(&["10.0.0.0/8", "registry.lan:5000"]);
+        assert!(c.is_insecure("10.1.2.3:5000"));
+        assert!(!c.is_listed_host("10.1.2.3:5000"));
+        assert!(c.is_listed_host("registry.lan:5000"));
+    }
+
+    #[test]
     fn each_host_is_reached_its_own_way() {
         let mut c = cfg(&["registry.lan:5000"]);
         c.mirrors = vec![Mirror::parse("http://mirror.lan:5000").unwrap(), Mirror::parse("https://mirror.example.com").unwrap()];
         assert_eq!(c.reach("registry.lan:5000", false), Reach::Insecure);
-        assert_eq!(c.reach("localhost:5000", false), Reach::Http);
+        assert_eq!(c.reach("localhost:5000", false), Reach::Insecure);
         assert_eq!(c.reach("mirror.lan:5000", true), Reach::Http);
         assert_eq!(c.reach("mirror.example.com", true), Reach::Https);
         assert_eq!(c.reach("ghcr.io", false), Reach::Https);

@@ -251,24 +251,60 @@ fn write_config(engine: &Engine, id: &str) {
 }
 
 /// Applies a changed setting that buildkitd reads from its config (the
-/// registry mirrors): writes the file, and when the builder is running with
-/// no build under way, stops it, so the next build starts it with the new
-/// file. A build in flight keeps the old config until its next start.
+/// registry mirrors and insecure hosts). A builder that is not running reads
+/// the new file when it starts. One that is running with no build and no
+/// `buildx` session under way is stopped with the new file in place, so the
+/// next build starts it with that. A busy one is left as it is, and so is
+/// what [`WRITTEN`] says it runs with: the next build notices the difference
+/// and restarts it then.
 pub fn refresh(engine: &Engine) {
     // The same lock making, starting and stopping the builder take: a build
     // cannot start while its config is being replaced.
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
     let Some((id, status)) = find(engine) else { return };
-    write_config(engine, &id);
-    if status != Status::Running || BUILDS.load(Ordering::Relaxed) > 0 {
+    let action = refresh_action(status == Status::Running, builder_busy(engine, &id));
+    if action == Refresh::Leave {
         return;
     }
+    if action == Refresh::WriteOnly {
+        write_config(engine, &id);
+        return;
+    }
+    let before = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    write_config(engine, &id);
     if engine.is_paused(&id) {
         let _ = engine.pause(&id, false);
     }
     if let Err(e) = engine.stop(&id, Duration::from_secs(10)) {
         crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+        // Still running with what it had.
+        *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = before;
     }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Refresh {
+    /// Not running: the next start reads the new file.
+    WriteOnly,
+    /// Running and idle: new file, then stop, so the next build starts it.
+    WriteAndStop,
+    /// Running and busy: nothing is written, nothing stopped, and the
+    /// config it runs with stays what [`WRITTEN`] says.
+    Leave,
+}
+
+fn refresh_action(running: bool, busy: bool) -> Refresh {
+    match (running, busy) {
+        (false, _) => Refresh::WriteOnly,
+        (true, false) => Refresh::WriteAndStop,
+        (true, true) => Refresh::Leave,
+    }
+}
+
+/// A build through the daemon, or a `buildx` session executing in the
+/// builder, is under way: stopping it now would cut that off.
+fn builder_busy(engine: &Engine, id: &str) -> bool {
+    BUILDS.load(Ordering::Relaxed) > 0 || engine.running_execs(id) > 0
 }
 
 /// BuildKit's x86-64 emulator, which it runs amd64 build steps under when it
@@ -328,7 +364,7 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
     // `kiri registry` refresh it at once): restarted with the new file
     // while no build uses it, as buildkitd reads it only when it starts.
     let stale = status == Status::Running
-        && BUILDS.load(Ordering::Relaxed) == 0
+        && !builder_busy(engine, &id)
         && WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref().is_some_and(|w| *w != *super::daemon_json::current());
     if stale {
         if engine.is_paused(&id) {
@@ -1097,6 +1133,16 @@ fn du_rows(text: &str) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A busy builder (a build, or a buildx session) is never stopped, and
+    /// its recorded config is not advanced.
+    #[test]
+    fn a_settings_change_never_stops_a_busy_builder() {
+        assert_eq!(refresh_action(true, true), Refresh::Leave);
+        assert_eq!(refresh_action(true, false), Refresh::WriteAndStop);
+        assert_eq!(refresh_action(false, true), Refresh::WriteOnly);
+        assert_eq!(refresh_action(false, false), Refresh::WriteOnly);
+    }
 
     /// BuildKit looks the emulator up by name and skips it when it isn't
     /// executable, so the file taking its place must be a plain 0644 file.

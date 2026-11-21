@@ -8184,7 +8184,25 @@ window.kiri = {
       case "importdone": if (ctx.card?.total) { ctx.card.finished = true; drawCtxCard(); } ui.imp.running = false; ui.imp.summary = e.failed ? tr("Imported {done}; {failed} failed (hover “Failed” for why).", { done: e.done, failed: e.failed }) : trn(e.done, "Imported {n} item.", "Imported {n} items."); send("inventory", { name: ui.imp.source }); toast(e.failed ? "error" : "ok", ui.imp.summary); drawImportModal(); break;
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
-      case "registryconfig": ui.regcfg = e; ui.regDraft = { insecure: [...(e["insecure-registries"] || [])], mirrors: [...(e["registry-mirrors"] || [])] }; ui.regAdd = { insecure: "", mirrors: "" }; if (ui.view === "settings") render(); break;
+      case "registryconfig": {
+        // A list with edits not yet saved keeps them: saving the other list
+        // (or a save the daemon refused, which answers with the file as it
+        // was) must not throw them away. A list takes the file's version
+        // when it has no edits, or when it is the one just saved and the file
+        // changed.
+        const was = ui.regcfg, saving = ui.regSaving; ui.regSaving = null;
+        const keys = { insecure: "insecure-registries", mirrors: "registry-mirrors" };
+        const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+        for (const k of Object.keys(keys)) {
+          const fresh = e[keys[k]] || [], before = was ? was[keys[k]] : null;
+          const clean = !was || was.error || same(ui.regDraft[k], before);
+          const savedNow = saving === k && !same(fresh, before);
+          if (clean || savedNow) { ui.regDraft[k] = [...fresh]; ui.regAdd[k] = ""; }
+        }
+        ui.regcfg = e;
+        if (ui.view === "settings") render();
+        break;
+      }
       case "resources": ui.res = e; ui.resDraft = { cpus: e.cpus, memory_mib: e.memory_mib }; if (ui.view === "settings") render(); break;
       case "detail": openDetail(e.id); break;
       case "inspect":
@@ -8306,7 +8324,7 @@ $("content").addEventListener("click", (ev) => {
   else if ((el = t("[data-savepx]"))) send("setproxy", { value: ui.pxDraft });
   else if ((el = t("[data-regadd]"))) regListAdd(el.dataset.regadd);
   else if ((el = t("[data-regdel]"))) { const [k, i] = el.dataset.regdel.split(":"); ui.regDraft[k].splice(+i, 1); render(); }
-  else if ((el = t("[data-regsave]"))) send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } });
+  else if ((el = t("[data-regsave]"))) { ui.regSaving = el.dataset.regsave; send("setregistryconfig", { value: { [REG_KEY[el.dataset.regsave]]: ui.regDraft[el.dataset.regsave] } }); }
   else if ((el = t("[data-saverp]")) && ui.rports && !ui.rports.error) send("setrouterports", { value: { http: +(ui.rpDraft.http ?? ui.rports.http.port), https: +(ui.rpDraft.https ?? ui.rports.https.port) } });
   else if ((el = t("[data-saveres]"))) send("setresources", { value: ui.resDraft });
   else if ((el = t("[data-vmpower]"))) { el.disabled = true; powerEngine(el.dataset.vmpower); }

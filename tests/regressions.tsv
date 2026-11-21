@@ -173,7 +173,7 @@ insecure-http-push	#611	pushing to a plain-HTTP registry on the network failed: 
 insecure-selfsigned-pull	#329	pulling from a registry with a self-signed certificate failed UnknownIssuer with no way to allow it
 insecure-http-login	#329	docker login to a plain-HTTP registry failed: login always used HTTPS
 insecure-http-auth-pull	#329	pulling with credentials from a listed plain-HTTP registry failed
-insecure-other-port-still-refused	#329	an insecure entry must cover its own host and port only, as Docker matches it
+insecure-other-port-still-refused	#329	an insecure entry must cover its own host and port only, as Docker matches it, shown against a registry that answers on the unlisted port
 insecure-docker-info	#329	docker info listed no Insecure Registries
 insecure-build	#329	docker build FROM a plain-HTTP registry failed: buildkitd.toml had no http/insecure entry for it
 insecure-removed-refused	#329	a registry taken off the list must be refused again, without a restart
@@ -184,3 +184,4 @@ mirror-docker-info	#118	docker info listed no Registry Mirrors
 mirror-build	#118	docker build FROM a Docker Hub image did not use the configured mirror
 insecure-cli-remove	#329	kiri registry insecure remove must take a host off the list
 mirror-cli-add	#118	there was no way to add a Docker Hub mirror from the terminal into daemon.json
+hub-downgrade-refused	#329	Docker Hub must stay on verified HTTPS when its name resolves into a listed network, with a plain-HTTP registry on port 80 there

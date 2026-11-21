@@ -22,7 +22,9 @@ impl Mirror {
     /// `https://mirror.example.com/docker.io`, `http://mirror.lan:5000`.
     ///
     /// A mirror is HTTPS unless it is written `http://`, as with Docker; a
-    /// loopback one is plain HTTP, as every local registry is. A trailing
+    /// loopback one is asked as every local registry is, HTTPS (unchecked)
+    /// first and then plain HTTP, and one written `https://` stays HTTPS in
+    /// what is kept and shown. A trailing
     /// `/v2` is not part of the address.
     pub fn parse(input: &str) -> Result<Mirror, String> {
         let text = input.trim();
@@ -37,6 +39,9 @@ impl Mirror {
             return Err(format!("a mirror address has no username or password: {text}"));
         }
         let host = authority.as_str().to_ascii_lowercase();
+        if crate::config::is_hub(&host) {
+            return Err("Docker Hub is not a mirror of itself: it is always reached directly, over verified HTTPS".into());
+        }
         if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-[]:_".contains(&b)) {
             return Err(format!("not a host name: {host}"));
         }
@@ -53,7 +58,7 @@ impl Mirror {
         if !path.is_empty() && !path.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_/".contains(&b)) {
             return Err(format!("not a mirror path: {path}"));
         }
-        Ok(Mirror { http: scheme == "http" || is_local(&host), host, prefix: (!path.is_empty()).then(|| path.to_owned()) })
+        Ok(Mirror { http: scheme == "http", host, prefix: (!path.is_empty()).then(|| path.to_owned()) })
     }
 
     /// What Settings shows, `kiri registry mirror` prints and daemon.json
@@ -94,13 +99,23 @@ mod tests {
         assert_eq!(Mirror::parse("https://Mirror.Example.com/").unwrap().as_url(), "https://mirror.example.com");
         assert_eq!(Mirror::parse("https://mirror.example.net/docker.io").unwrap().prefix.as_deref(), Some("docker.io"));
         assert_eq!(Mirror::parse("https://mirror.example.com/v2").unwrap().prefix, None);
-        assert_eq!(Mirror::parse("127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
-        assert_eq!(Mirror::parse("https://127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
+        // An explicit https:// stays so, loopback or not; a bare loopback
+        // address is asked HTTPS first, then HTTP, like a loopback registry.
+        assert_eq!(Mirror::parse("https://127.0.0.1:5000").unwrap().as_url(), "https://127.0.0.1:5000");
+        assert_eq!(Mirror::parse("http://127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
+        assert!(!Mirror::parse("127.0.0.1:5000").unwrap().http);
         assert_eq!(Mirror::parse("https://mirror.example.net/docker.io").unwrap().buildkit(), "mirror.example.net/docker.io");
         // Docker asks a mirror written http:// over plain HTTP; so does Kiri.
         let plain = Mirror::parse("http://Mirror.Lan:5000/").unwrap();
         assert_eq!((plain.host.as_str(), plain.http, plain.as_url().as_str()), ("mirror.lan:5000", true, "http://mirror.lan:5000"));
         assert!(!Mirror::parse("mirror.lan:5000").unwrap().http);
+    }
+
+    #[test]
+    fn docker_hub_is_not_a_mirror() {
+        for hub in ["docker.io", "http://docker.io", "https://docker.io", "http://index.docker.io", "http://registry-1.docker.io", "https://registry-1.docker.io:443/x"] {
+            assert!(Mirror::parse(hub).is_err(), "{hub}");
+        }
     }
 
     #[test]
