@@ -342,14 +342,17 @@ t insecure-http-auth-pull "Downloaded newer image" "docker pull kiri-trusted.tes
 t insecure-other-port-listening "200" "curl -s -o /dev/null -w '%{http_code}' kiri-trusted.test:5057/v2/"
 t insecure-other-port-still-refused "refused" "docker pull kiri-trusted.test:5057/team/alp:1 >/dev/null 2>&1 $PULLED"
 t insecure-docker-info "kiri-trusted.test:5055" "docker info 2>/dev/null | sed -n '/Insecure Registries/,/^ [A-Z]/p'"
-t insecure-build "erucesni-tliub" "mkdir -p /bins && printf 'FROM $RIP:5055/team/alp:1\\nRUN echo built-insecure | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins 2>&1 | grep -m1 -o erucesni-tliub"
+# The builder is a container: it reaches the registry container on the
+# bridge at its own address (a published port on the engine's address is not
+# reachable from a container in every host's network).
+t insecure-build "erucesni-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry insecure add \$gw >/dev/null 2>&1; mkdir -p /bins && printf \"FROM \$gw/team/alp:1\\nRUN echo built-insecure | rev\\n\" > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o erucesni-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
 t insecure-cli-remove "kiri-trusted.test:5056" "/opt/kiri/kiri registry insecure remove kiri-trusted.test:5055 kiri-other.test:5444 2>&1"
 t insecure-removed-refused "refused" "docker rmi kiri-other.test:5444/team/alp:1 >/dev/null 2>&1; docker pull kiri-other.test:5444/team/alp:1 >/dev/null 2>&1 $PULLED"
 t insecure-hand-edit "Downloaded newer image" "printf '{\"insecure-registries\": [\"kiri-other.test:5444\"], \"debug\": true}\\n' > /root/.kiri/daemon.json; docker pull kiri-other.test:5444/team/alp:1 2>&1"
 t insecure-hand-edit-keeps-keys "kept" "/opt/kiri/kiri registry mirror add http://$RIP:5055 >/dev/null 2>&1; f=/root/.kiri/daemon.json; grep -q '\"debug\": true' \$f && grep -q 'http://$RIP:5055' \$f && grep -q kiri-other.test:5444 \$f && echo kept"
 t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
 t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
-t mirror-build "rorrim-tliub" "docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins 2>&1 | grep -m1 -o rorrim-tliub"
+t mirror-build "rorrim-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry mirror remove http://$RIP:5055 >/dev/null 2>&1; /opt/kiri/kiri registry mirror add http://\$gw >/dev/null 2>&1; docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o rorrim-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
 # Docker Hub is reached over verified HTTPS whatever the list covers: a
 # name server (here /etc/hosts) that puts its name inside a listed network,
 # in front of a plain-HTTP registry on port 80, must not turn the pull into
