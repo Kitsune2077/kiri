@@ -478,6 +478,16 @@ fn final_url(resp: &ureq::http::Response<ureq::Body>) -> Option<String> {
     resp.extensions().get::<FinalUrl>().map(|f| f.0.clone()).or_else(|| Some(resp.get_uri().to_string()))
 }
 
+/// Whether a response that ended at `final_url` came from the registry at
+/// `base`: the same scheme, host and port, or the same host moved up from
+/// http to https (the default ports 80 to 443, or the same explicit port),
+/// which is the registry upgrading the connection, not handing it to anyone.
+/// A different host, a different port, or https down to http is not.
+fn is_own_origin(final_url: &str, base: &str) -> bool {
+    let (Some(f), Some(b)) = (origin_of(final_url), origin_of(base)) else { return false };
+    f == b || (!b.0 && f.0 && f.1 == b.1 && (f.2 == b.2 || (b.2 == 80 && f.2 == 443)))
+}
+
 /// The scheme, host and port a URL names (the default port of its scheme if
 /// it has none): what must all match for a request to stay "the same place".
 fn origin_of(url: &str) -> Option<(bool, String, u16)> {
@@ -1321,7 +1331,7 @@ impl Client {
             // host a redirect or an upload address named) is not the
             // registry asking: its challenge is not answered with the
             // registry's credentials.
-            let own = final_url(&rsp).and_then(|u| origin_of(&u)).is_some_and(|o| Some(o) == origin_of(&registry_base));
+            let own = final_url(&rsp).is_some_and(|u| is_own_origin(&u, &registry_base));
             if rsp.status().as_u16() == 401 && attempt == 0 && own {
                 let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 drain(rsp);
@@ -1503,7 +1513,7 @@ impl Client {
             200 => Ok(()),
             // A 401 from another origin (a redirect off the registry) is not
             // the registry asking: its challenge gets no credentials.
-            401 if final_url(&resp).and_then(|u| origin_of(&u)) != origin_of(&url) => {
+            401 if !final_url(&resp).is_some_and(|u| is_own_origin(&u, &url)) => {
                 Err(Error::Status { url, status: 401, body: "unauthorized: the registry sent the request elsewhere".into() })
             }
             401 => {
@@ -2808,6 +2818,49 @@ mod tests {
         let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
         assert!(heads.contains("get /v2/"), "{heads}");
         assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
+    }
+
+    /// The same with a list of networks (the slow path, where the verified
+    /// agent follows the redirect itself): the evil host's own http realm
+    /// gets no token request and no credentials.
+    #[test]
+    fn a_redirect_target_that_challenges_gets_nothing_with_a_network_listed() {
+        let evil_host = Arc::new(Mutex::new(String::new()));
+        let h = evil_host.clone();
+        let (evil, evil_seen) = recording_server(move |head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into()
+            } else {
+                CHALLENGE.replace("EVIL", &h.lock().unwrap())
+            }
+        });
+        *evil_host.lock().unwrap() = evil.clone();
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let (a, _) = recording_server(move |_| {
+            if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into() } else { redirect(&format!("http://{evil}/blob")) }
+        });
+        let c = listing(&["10.0.0.0/8"]).with_credentials(me());
+        let r = Reference::parse(&format!("{a}/t/b:1")).unwrap();
+        assert!(c.get(&r, &format!("http://{a}/v2/t/blobs/sha256:x"), None).is_err());
+        let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /blob"), "{heads}");
+        assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
+    }
+
+    #[test]
+    fn an_upgrade_to_https_on_the_same_host_is_the_registrys_own() {
+        // Up from http on the same host: default ports, or the same explicit port.
+        assert!(is_own_origin("https://r.lan/v2/", "http://r.lan"));
+        assert!(is_own_origin("https://r.lan:5000/v2/", "http://r.lan:5000"));
+        assert!(is_own_origin("https://R.LAN/x", "http://r.lan"));
+        // Everything else is a hand-off.
+        assert!(is_own_origin("http://r.lan/x", "http://r.lan"));
+        assert!(!is_own_origin("https://other.lan/x", "http://r.lan"));
+        assert!(!is_own_origin("https://r.lan:8443/x", "http://r.lan"));
+        assert!(!is_own_origin("https://r.lan:5001/x", "http://r.lan:5000"));
+        assert!(!is_own_origin("http://r.lan/x", "https://r.lan"), "https down to http");
+        assert!(!is_own_origin("http://r.lan:81/x", "http://r.lan"));
+        assert!(!is_own_origin("not a url", "http://r.lan"));
     }
 
     #[test]
