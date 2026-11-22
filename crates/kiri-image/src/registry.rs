@@ -1345,12 +1345,21 @@ impl Client {
     /// server is fetched verified), `auth` only to the origin first asked
     /// (see [`Client::hop`]). `query` goes on the first request only.
     fn get_following(&self, url: &str, owner: &str, auth: Option<&str>, headers: &[(&str, String)], query: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        self.following(false, url, owner, auth, headers, query)
+    }
+
+    /// [`Client::get_following`] for a HEAD.
+    fn head_following(&self, url: &str, owner: &str, auth: Option<&str>) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+        self.following(true, url, owner, auth, &[], &[])
+    }
+
+    fn following(&self, head: bool, url: &str, owner: &str, auth: Option<&str>, headers: &[(&str, String)], query: &[(&str, &str)]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
         let origin = url.to_owned();
         let mut url = url.to_owned();
         let mut keep_auth = true;
         for hop in 0..10 {
             let agent = self.agent_for_hop(&url, owner);
-            let mut req = agent.get(&url);
+            let mut req = if head { agent.head(&url) } else { agent.get(&url) };
             if hop == 0 {
                 for (k, v) in query {
                     req = req.query(*k, *v);
@@ -1613,16 +1622,12 @@ impl Client {
             image.layers.iter().map(|l| (l.digest.clone(), l.size)).chain(std::iter::once((image.config_digest.clone(), config_size))).collect();
         for (digest, size) in &blobs {
             let url = format!("{base}/v2/{repo}/blobs/{digest}");
-            let head = self.authed(target, "pull,push", |auth| {
-                let mut req = self.agent_for(&url).head(&url);
-                if let Some(a) = auth {
-                    req = req.header("Authorization", a);
-                }
-                req.call()
-            })?;
-            // A redirect sends the HEAD on to where the registry keeps the
-            // blob: it has it.
-            if head.status().as_u16() == 200 || is_redirect(head.status().as_u16()) {
+            let owner = url_host(&url).unwrap_or_default();
+            // Redirects (to where the registry keeps the blob) are followed
+            // hop by hop, as a GET's are: the blob is there only if the
+            // last answer says so.
+            let head = self.authed(target, "pull,push", |auth| self.head_following(&url, &owner, auth))?;
+            if head.status().as_u16() == 200 {
                 progress(PushProgress::Exists { digest: digest.clone() });
                 continue;
             }
@@ -2877,6 +2882,43 @@ mod tests {
         assert!(a_heads.contains("authorization: bearer tok"), "the registry itself is sent them: {a_heads}");
         assert!(b_heads.contains("put /elsewhere"), "{b_heads}");
         assert!(!b_heads.contains("authorization"), "{b_heads}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A blob's HEAD that is redirected is followed: a blob the storage
+    /// answers 404 for is uploaded, one it has is not.
+    #[test]
+    fn a_redirected_blob_check_is_followed_to_its_answer() {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-push-head-redirect-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let mut w = store.ingest().unwrap();
+        w.write_all(b"\x1f\x8bnot really gzip either").unwrap();
+        let (layer, size) = w.finish().unwrap();
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&config).unwrap()).unwrap();
+        let (cfg, _) = w.finish().unwrap();
+        let image = crate::archive::from_config("up:1".into(), &cfg, &config, vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        for (storage_status, uploads) in [("404 Not Found", true), ("200 OK", false)] {
+            let (storage, storage_seen) = recording_server(move |_| format!("HTTP/1.1 {storage_status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"));
+            let (a, a_seen) = recording_server(move |head| {
+                if head.starts_with("GET /v2/ ") {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into()
+                } else if head.starts_with("HEAD") {
+                    format!("HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{storage}/blob\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                } else if head.starts_with("POST") {
+                    "HTTP/1.1 202 Accepted\r\nLocation: /v2/t/blobs/uploads/1\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                } else {
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+                }
+            });
+            test_client().push(&store, &image, &Reference::parse(&format!("{a}/t:1")).unwrap(), &|_| {}).unwrap();
+            let heads = a_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+            assert!(storage_seen.lock().unwrap().join("\n").to_ascii_lowercase().contains("head /blob"), "the HEAD was followed");
+            assert_eq!(heads.contains("post /v2/t/blobs/uploads/"), uploads, "{storage_status}: {heads}");
+        }
         let _ = std::fs::remove_dir_all(&root);
     }
 
