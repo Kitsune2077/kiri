@@ -433,6 +433,14 @@ fn url_host(url: &str) -> Option<String> {
     url.parse::<ureq::http::Uri>().ok()?.authority().map(|a| a.as_str().rsplit('@').next().unwrap_or_default().to_ascii_lowercase())
 }
 
+/// A canonical `host[:port]` without its port: `[::1]:80` is `[::1]`.
+fn without_port(host: &str) -> &str {
+    match host.strip_prefix('[') {
+        Some(_) => host.split_inclusive(']').next().unwrap_or(host),
+        None => host.split(':').next().unwrap_or(host),
+    }
+}
+
 /// The port a `host[:port]` names: `Ok(None)` when it names none, `Err`
 /// when what follows the colon is not a port from 1 to 65535.
 fn named_port(host: &str) -> Result<Option<u16>, ()> {
@@ -851,9 +859,12 @@ impl Client {
 
     /// Whether a token `realm` the registry named may be asked: over HTTPS,
     /// or over plain HTTP only on the insecure registry's own host and port
-    /// (a registry on plain HTTP names its own address for tokens). For a
-    /// registry on this machine its own port on this machine counts as its
-    /// own, however the realm spells loopback (`localhost`, `127.0.0.1`,
+    /// (a registry on plain HTTP names its own address for tokens). A realm
+    /// named without a port is on plain HTTP's; a registry named without one
+    /// on the port of the scheme it answered on, and on none while that is
+    /// not known. A registry that answered HTTPS gets no plain-HTTP realm.
+    /// For a registry on this machine its own port on this machine counts as
+    /// its own, however the realm spells loopback (`localhost`, `127.0.0.1`,
     /// `[::1]`); a name under `.localhost` does not, as a resolver may send
     /// it to DNS. Never in the clear to another host or port, listed or not,
     /// and never because of a network entry.
@@ -865,31 +876,32 @@ impl Client {
             return false;
         }
         let Some(host) = url_host(realm) else { return false };
-        let same = crate::config::canonical(&host).is_some_and(|h| Some(h) == crate::config::canonical(registry));
-        // This machine runs other people's services on its other ports: a
-        // realm here must be on the registry's own port, however either
-        // spells loopback. A realm named without a port is on plain HTTP's;
-        // a registry named without one on the port of the scheme it
-        // answered on.
-        let own = if crate::reference::is_local(&host) {
-            let realm_port = named_port(&host).map(|p| p.unwrap_or(80));
-            let registry_port = named_port(registry).map(|p| p.or_else(|| self.scheme_port(registry)));
-            crate::reference::is_local(registry) && matches!((realm_port, registry_port), (Ok(a), Ok(Some(b))) if a == b)
+        let same_host = if crate::reference::is_local(&host) {
+            crate::reference::is_local(registry)
         } else {
-            same
+            let name = |h: &str| crate::config::canonical(h).map(|c| without_port(&c).to_owned());
+            name(&host).is_some_and(|h| Some(h) == name(registry))
         };
-        self.config.is_unverified(registry) && !crate::config::is_hub(&host) && own
+        let realm_port = named_port(&host).map(|p| p.unwrap_or(80));
+        let registry_port = named_port(registry).map(|p| p.or_else(|| self.scheme_port(registry)));
+        let same_port = matches!((realm_port, registry_port), (Ok(a), Ok(Some(b))) if a == b);
+        self.config.is_unverified(registry) && !crate::config::is_hub(&host) && same_host && same_port && self.known_scheme(registry) != Some("https")
+    }
+
+    /// The scheme a registry is reached on: HTTPS for a verified one, and
+    /// for one reached either way the one the probe found (never probed
+    /// from here); `None` while that isn't known.
+    fn known_scheme(&self, registry: &str) -> Option<&'static str> {
+        match self.config.reach(registry) {
+            Reach::Https => Some("https"),
+            Reach::Insecure => remembered_scheme(&crate::config::canonical(registry).unwrap_or_else(|| registry.to_ascii_lowercase())),
+        }
     }
 
     /// The port a registry named without one is reached on: 443 over
-    /// HTTPS, 80 over plain HTTP. For one reached either way, as the probe
-    /// found it (never probed from here); `None` while that isn't known.
+    /// HTTPS, 80 over plain HTTP ([`Client::known_scheme`]).
     fn scheme_port(&self, registry: &str) -> Option<u16> {
-        let scheme = match self.config.reach(registry) {
-            Reach::Https => "https",
-            Reach::Insecure => remembered_scheme(&crate::config::canonical(registry).unwrap_or_else(|| registry.to_ascii_lowercase()))?,
-        };
-        Some(if scheme == "http" { 80 } else { 443 })
+        Some(if self.known_scheme(registry)? == "http" { 80 } else { 443 })
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -2315,11 +2327,12 @@ mod tests {
         remember_scheme("[::1]".into(), "https", Duration::from_secs(60));
         assert!(!c.realm_is_secure("http://[::1]/token", "[::1]"));
         assert!(!c.realm_is_secure("http://127.0.0.1/token", "[::1]"));
-        assert!(c.realm_is_secure("http://127.0.0.1:443/token", "[::1]"));
+        assert!(!c.realm_is_secure("http://127.0.0.1:443/token", "[::1]"), "a registry that answered HTTPS gets no plain-HTTP realm");
         assert_eq!((named_port("h:5000"), named_port("h"), named_port("[::1]"), named_port("[::1]:80")), (Ok(Some(5000)), Ok(None), Ok(None), Ok(Some(80))));
         assert_eq!((named_port("h:"), named_port("h:0"), named_port("h:70000"), named_port("h:x")), (Err(()), Err(()), Err(()), Err(())));
         // A plain-HTTP realm gets them only when insecure-registries lists
         // its host (a registry on plain HTTP names its own address).
+        remember_scheme("registry.lan".into(), "http", Duration::from_secs(60));
         let listed = Client::new().with_config(RegistryConfig { insecure: vec![crate::config::Insecure::parse("registry.lan").unwrap()], ..Default::default() });
         assert!(listed.realm_is_secure("http://registry.lan/service/token", "registry.lan"));
         assert!(!listed.realm_is_secure("http://auth.example.com/token", "registry.lan"));
@@ -2831,6 +2844,32 @@ mod tests {
         assert!(!c.unverified_ok("[fd00::2]:5000", "[fd00::1]:5000"), "another address in the network is not the registry");
     }
 
+    /// A listed registry named without a port, off this machine, is held
+    /// to the same port rule as one on it: a plain-HTTP realm on port 80 is
+    /// its own only when it answered plain HTTP there, never once it
+    /// answered HTTPS (on 443) or before its scheme is known.
+    #[test]
+    fn a_listed_registrys_plain_http_realm_is_on_its_own_port() {
+        let listed = |e: &[&str]| test_client().with_config(RegistryConfig { insecure: e.iter().map(|e| crate::config::Insecure::parse(e).unwrap()).collect(), mirrors: Vec::new() });
+        let c = listed(&["realm-unknown.lan", "realm-https.lan", "realm-http.lan", "realm-port.lan:5000"]);
+        assert!(!c.realm_is_secure("http://realm-unknown.lan/token", "realm-unknown.lan"), "scheme not known yet");
+        remember_scheme("realm-https.lan".into(), "https", Duration::from_secs(60));
+        assert!(!c.realm_is_secure("http://realm-https.lan/token", "realm-https.lan"));
+        assert!(!c.realm_is_secure("http://realm-https.lan:443/token", "realm-https.lan"));
+        remember_scheme("realm-http.lan".into(), "http", Duration::from_secs(60));
+        assert!(c.realm_is_secure("http://realm-http.lan/token", "realm-http.lan"));
+        assert!(c.realm_is_secure("http://realm-http.lan:80/token", "realm-http.lan"));
+        assert!(!c.realm_is_secure("http://realm-http.lan:8080/token", "realm-http.lan"));
+        assert!(c.realm_is_secure("http://realm-port.lan:5000/token", "realm-port.lan:5000"));
+        assert!(!c.realm_is_secure("http://realm-port.lan/token", "realm-port.lan:5000"));
+        assert!(!c.realm_is_secure("http://realm-port.lan:5001/token", "realm-port.lan:5000"));
+        // A network entry, named by address: the same rule.
+        let net = listed(&["10.0.0.0/8"]);
+        remember_scheme("10.9.8.7".into(), "https", Duration::from_secs(60));
+        assert!(!net.realm_is_secure("http://10.9.8.7/token", "10.9.8.7"));
+        assert_eq!((without_port("[::1]:80"), without_port("[::1]"), without_port("h.lan:5000"), without_port("h.lan")), ("[::1]", "[::1]", "h.lan", "h.lan"));
+    }
+
     #[test]
     fn a_redirect_is_made_absolute_against_where_it_came_from() {
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "https://s3.example.com/b?sig=1"), "https://s3.example.com/b?sig=1");
@@ -2872,6 +2911,7 @@ mod tests {
         // A listed registry: itself and listed hosts, but not a host only a
         // network covers.
         let c = listing(&["registry.lan", "auth.lan", "10.0.0.0/8"]);
+        remember_scheme("registry.lan".into(), "http", Duration::from_secs(60));
         assert!(c.realm_is_secure("http://registry.lan/token", "registry.lan"));
         // Another listed host is still another host: no plain-HTTP realm there.
         assert!(!c.realm_is_secure("http://auth.lan/token", "registry.lan"));
@@ -2879,7 +2919,9 @@ mod tests {
         assert!(!c.realm_is_secure("http://10.1.2.3/token", "registry.lan"));
         assert!(c.agent_for_hop("https://auth.lan/token", "registry.lan").config().tls_config().disable_verification());
         assert!(!c.agent_for_hop("https://10.1.2.3/token", "registry.lan").config().tls_config().disable_verification());
-        // A registry the network covers may name itself.
+        // A registry the network covers may name itself, once it answered
+        // plain HTTP.
+        remember_scheme("10.1.2.4".into(), "http", Duration::from_secs(60));
         assert!(c.realm_is_secure("http://10.1.2.4/token", "10.1.2.4"));
         assert!(!c.realm_is_secure("http://10.1.2.5/token", "10.1.2.4"));
     }
