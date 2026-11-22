@@ -2947,6 +2947,53 @@ mod tests {
         assert_eq!(c.for_mirror(&Reference::parse(&format!("{host}/library/alpine:3")).unwrap()).base("registry-1.docker.io"), "https://registry-1.docker.io");
     }
 
+    /// A registry on self-signed HTTPS that answers 401: it answered
+    /// HTTPS, so it is asked over HTTPS from then on (no plain HTTP), and a
+    /// login's Basic answer goes to it there, the certificate unchecked.
+    #[test]
+    fn a_self_signed_registry_that_challenges_stays_on_https() {
+        let (host, seen) = tls_recording_server(|_| "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        assert_eq!(insecure_scheme(&host), "https");
+        assert_eq!(remembered_scheme(&host), Some("https"));
+        let c = test_client().with_credentials(me());
+        assert_eq!(c.base(&host), format!("https://{host}"));
+        assert!(c.login(&host).is_err(), "the registry refuses the password");
+        let heads = seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("authorization: basic"), "the Basic answer went over HTTPS: {heads}");
+    }
+
+    /// A mirror that wants a token, asked by a client signed in to Docker
+    /// Hub: its challenge is answered anonymously, and nothing of the Hub
+    /// sign-in reaches it, the token request included.
+    #[test]
+    fn a_mirrors_token_challenge_is_answered_without_the_hub_sign_in() {
+        let me_host: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let at = me_host.clone();
+        let (mirror, seen) = serve_recording(false, move |head| {
+            let lower = head.to_ascii_lowercase();
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"mt\"}".into()
+            } else if lower.contains("authorization: bearer mt") {
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            } else {
+                format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{}/token\",service=\"m\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", at.get().unwrap())
+            }
+        });
+        me_host.set(mirror.clone()).unwrap();
+        let root = std::env::temp_dir().join(format!("kiri-mirror-401-{}", std::process::id()));
+        let store = Store::open(&root).unwrap();
+        let name = Reference::parse("alpine:3.22").unwrap();
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        let signed_in = test_client().with_credentials(Some(Credentials { username: "alice".into(), password: "hub-password".into(), registry_token: "hub-token".into(), ..Default::default() }));
+        assert!(signed_in.pull_from(&store, &name, &[name.via(&mirror, None)], &platform, &|_| {}, &Cancel::new()).is_err());
+        let heads = seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /token"), "the mirror's challenge was answered: {heads}");
+        let token_request = heads.split("\r\n\r\n").find(|h| h.contains("get /token")).unwrap_or_default().to_owned();
+        assert!(!token_request.contains("authorization"), "{token_request}");
+        assert!(!heads.contains("basic ") && !heads.contains("hub-token") && !heads.contains("alice"), "{heads}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn a_redirect_is_made_absolute_against_where_it_came_from() {
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "https://s3.example.com/b?sig=1"), "https://s3.example.com/b?sig=1");
