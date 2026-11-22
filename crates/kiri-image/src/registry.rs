@@ -775,6 +775,11 @@ fn insecure_scheme(host: &str) -> &'static str {
     // A server that waits instead of refusing a handshake it can't read
     // gets as long as Docker gives a TLS handshake.
     let answers = |url: String, agent: ureq::Agent| agent.get(&url).config().timeout_global(Some(Duration::from_secs(10))).build().call().map(drain).is_ok();
+    // Stopped before it began, or while waiting for another pull's probe:
+    // nothing is asked, and nothing learnt.
+    if crate::cancel::current_cancelled() {
+        return "https";
+    }
     let (scheme, ttl) = if answers(format!("https://{host}/v2/"), insecure_agent()) {
         ("https", SCHEME_TTL)
     } else if crate::cancel::current_cancelled() {
@@ -2248,6 +2253,25 @@ mod tests {
         c.put(&big_digest, &big_digest, &big, OCI_MANIFEST);
         assert!(c.get(&key).is_none());
         assert_eq!(c.bytes, big.len());
+    }
+
+    /// A pull stopped before the scheme probe starts asks nothing at all:
+    /// here a listener that would record the connection.
+    #[test]
+    fn a_stopped_pull_probes_no_scheme() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let scheme = {
+            let _on = cancel.enter();
+            insecure_scheme(&host)
+        };
+        assert_eq!(scheme, "https");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(listener.accept().is_err(), "a probe was sent");
+        assert!(remembered_scheme(&host).is_none(), "nothing is remembered");
     }
 
     #[test]
