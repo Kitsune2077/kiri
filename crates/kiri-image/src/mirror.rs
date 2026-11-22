@@ -24,11 +24,11 @@ impl Mirror {
     /// `kiri registry mirror add`: `mirror.example.com`, `https://mirror.example.com`,
     /// `https://mirror.example.com/docker.io`, `http://mirror.lan:5000`.
     ///
-    /// A mirror is HTTPS unless it is written `http://`, as with Docker; a
-    /// loopback one is asked as every local registry is, HTTPS (unchecked)
-    /// first and then plain HTTP, and one written `https://` stays HTTPS in
-    /// what is kept and shown. A trailing
-    /// `/v2` is not part of the address.
+    /// A mirror is HTTPS unless it is written `http://`, as with Docker, and
+    /// is asked over that scheme only: never probed, never down from HTTPS
+    /// to plain HTTP. On this machine or a host in `insecure-registries`
+    /// its certificate goes unchecked. A trailing `/v2` is not part of the
+    /// address.
     pub fn parse(input: &str) -> Result<Mirror, String> {
         let text = input.trim();
         if text.is_empty() {
@@ -103,8 +103,8 @@ mod tests {
         assert_eq!(Mirror::parse("https://Mirror.Example.com/").unwrap().as_url(), "https://mirror.example.com");
         assert_eq!(Mirror::parse("https://mirror.example.net/docker.io").unwrap().prefix.as_deref(), Some("docker.io"));
         assert_eq!(Mirror::parse("https://mirror.example.com/v2").unwrap().prefix, None);
-        // An explicit https:// stays so, loopback or not; a bare loopback
-        // address is asked HTTPS first, then HTTP, like a loopback registry.
+        // An explicit https:// stays so, loopback or not, and so does a
+        // bare address.
         assert_eq!(Mirror::parse("https://127.0.0.1:5000").unwrap().as_url(), "https://127.0.0.1:5000");
         assert_eq!(Mirror::parse("http://127.0.0.1:5000").unwrap().as_url(), "http://127.0.0.1:5000");
         assert!(!Mirror::parse("127.0.0.1:5000").unwrap().http);

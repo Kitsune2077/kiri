@@ -379,6 +379,10 @@ pub struct Client {
     /// Whether Docker Hub pulls go through the mirrors: not for the client
     /// a mirror itself is asked with.
     use_mirrors: bool,
+    /// For the client a mirror is asked with: its host and the scheme it
+    /// was written with, used as written (`http://` straight over plain
+    /// HTTP, `https://` never down to it), as Docker uses a mirror's.
+    mirror_scheme: Option<(String, &'static str)>,
 }
 
 impl Default for Client {
@@ -804,7 +808,7 @@ fn insecure_scheme(host: &str) -> &'static str {
 impl Client {
     pub fn new() -> Client {
         let config = CONFIG_SOURCE.get().map(|f| f()).unwrap_or_default();
-        Client { agent: shared_agent(), credentials: None, config, use_mirrors: true }
+        Client { agent: shared_agent(), credentials: None, config, use_mirrors: true, mirror_scheme: None }
     }
 
     /// This client with `config` in place of daemon.json's settings.
@@ -815,14 +819,21 @@ impl Client {
 
     /// `https://host`, and for a registry on this machine or in
     /// `insecure-registries` whichever of HTTPS (its certificate unchecked)
-    /// and plain HTTP it answers on, HTTPS first. A mirror written `http://`
-    /// is one of those (see [`RegistryConfig::mirror_allowed`]).
+    /// and plain HTTP it answers on, HTTPS first. A mirror is asked with the
+    /// scheme it was written with, unprobed ([`Client::for_mirror`]).
     fn base(&self, host: &str) -> String {
-        let scheme = match self.config.reach(host) {
-            Reach::Https => "https",
-            Reach::Insecure => insecure_scheme(host),
+        let scheme = match (self.written_scheme(host), self.config.reach(host)) {
+            (Some(scheme), _) => scheme,
+            (None, Reach::Https) => "https",
+            (None, Reach::Insecure) => insecure_scheme(host),
         };
         format!("{scheme}://{host}")
+    }
+
+    /// The scheme `host` was written with, when it is the mirror this
+    /// client asks.
+    fn written_scheme(&self, host: &str) -> Option<&'static str> {
+        self.mirror_scheme.as_ref().filter(|(h, _)| h.eq_ignore_ascii_case(host)).map(|(_, s)| *s)
     }
 
     /// The agent for a request to `url`, a registry's own address: the one
@@ -892,6 +903,9 @@ impl Client {
     /// for one reached either way the one the probe found (never probed
     /// from here); `None` while that isn't known.
     fn known_scheme(&self, registry: &str) -> Option<&'static str> {
+        if let Some(scheme) = self.written_scheme(registry) {
+            return Some(scheme);
+        }
         match self.config.reach(registry) {
             Reach::Https => Some("https"),
             Reach::Insecure => remembered_scheme(&crate::config::canonical(registry).unwrap_or_else(|| registry.to_ascii_lowercase())),
@@ -994,7 +1008,17 @@ impl Client {
     /// leaves for a third party's registry. Mirrors serve public images;
     /// one that needs a login is not supported.
     fn anonymous(&self) -> Client {
-        Client { agent: self.agent.clone(), credentials: None, config: self.config.clone(), use_mirrors: false }
+        Client { agent: self.agent.clone(), credentials: None, config: self.config.clone(), use_mirrors: false, mirror_scheme: None }
+    }
+
+    /// [`Client::anonymous`] for the mirror at `target`: it is asked over
+    /// the scheme its address was written with, as Docker asks a mirror,
+    /// with no probe and no fall back from HTTPS to plain HTTP. HTTPS to a
+    /// mirror on this machine or in `insecure-registries` leaves the
+    /// certificate unchecked, as for any registry there.
+    fn for_mirror(&self, target: &Reference) -> Client {
+        let scheme = self.mirrors().into_iter().find(|m| m.host.eq_ignore_ascii_case(&target.registry)).map(|m| if m.http { "http" } else { "https" });
+        Client { mirror_scheme: scheme.map(|s| (target.registry.clone(), s)), ..self.anonymous() }
     }
 
     /// The references a pull of `name` tries, in order: the configured
@@ -1070,7 +1094,7 @@ impl Client {
             // the official registry is asked with them. The layers come from
             // where the manifest did, asked the same way.
             let mirror = target.registry != name.registry;
-            let anonymous = mirror.then(|| self.anonymous());
+            let anonymous = mirror.then(|| self.for_mirror(target));
             let client = anonymous.as_ref().unwrap_or(self);
             // A mirror that fails anywhere in the pull (no manifest, a layer
             // missing or wrong, an image for another platform) hands it to
@@ -2222,9 +2246,9 @@ mod tests {
     #[test]
     fn tokens_are_kept_apart_by_who_asked() {
         let r = Reference::parse("alpine").unwrap();
-        let anon = Client { agent: shared_agent(), credentials: None, config: Default::default(), use_mirrors: true };
-        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }), config: Default::default(), use_mirrors: true };
-        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }), config: Default::default(), use_mirrors: true };
+        let anon = Client { agent: shared_agent(), credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
+        let alice = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "a".into(), ..Default::default() }), config: Default::default(), use_mirrors: true, mirror_scheme: None };
+        let other = Client { agent: shared_agent(), credentials: Some(Credentials { username: "alice".into(), password: "b".into(), ..Default::default() }), config: Default::default(), use_mirrors: true, mirror_scheme: None };
         let keys = [anon.token_key(&r, "pull"), alice.token_key(&r, "pull"), other.token_key(&r, "pull"), alice.token_key(&r, "pull,push")];
         for (i, a) in keys.iter().enumerate() {
             for b in &keys[i + 1..] {
@@ -2395,7 +2419,7 @@ mod tests {
     fn test_client() -> Client {
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
-        Client { agent, credentials: None, config: Default::default(), use_mirrors: true }
+        Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None }
     }
 
     /// A registry that takes every push: blobs are missing until put, and
@@ -2642,7 +2666,7 @@ mod tests {
         // Stalls only give up after 10 s: the cancel must not wait for that.
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_secs(10)), ureq::unversioned::resolver::DefaultResolver::default());
-        let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true };
+        let client = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         // A loopback registry's scheme is asked once (HTTPS, then HTTP):
         // done before the clock for the cancel starts.
         let _ = client.base(&host);
@@ -2870,6 +2894,41 @@ mod tests {
         assert_eq!((without_port("[::1]:80"), without_port("[::1]"), without_port("h.lan:5000"), without_port("h.lan")), ("[::1]", "[::1]", "h.lan", "h.lan"));
     }
 
+    /// A mirror is asked over the scheme it was written with, unprobed:
+    /// `http://` straight over plain HTTP, `https://` over HTTPS only, even
+    /// on this machine where a registry is probed and may fall back. The
+    /// server here would answer a probe's plain-HTTP request; it is never
+    /// asked.
+    #[test]
+    fn a_mirror_is_asked_over_the_scheme_it_was_written_with() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = listener.local_addr().unwrap().to_string();
+        let conns = Arc::new(AtomicUsize::new(0));
+        let seen = conns.clone();
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                let Ok(mut c) = c else { continue };
+                seen.fetch_add(1, Ordering::SeqCst);
+                let _ = c.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}");
+            }
+        });
+        let hub = Reference::parse("alpine:3").unwrap();
+        for (written, scheme) in [(format!("https://{host}"), "https"), (format!("http://{host}"), "http")] {
+            let c = test_client().with_config(RegistryConfig { insecure: Vec::new(), mirrors: vec![Mirror::parse(&written).unwrap()] });
+            let target = c.targets(&hub).remove(0);
+            assert_eq!(target.registry, host);
+            let m = c.for_mirror(&target);
+            assert_eq!(m.base(&target.registry), format!("{scheme}://{host}"), "{written}");
+            assert_eq!(m.known_scheme(&target.registry), Some(scheme));
+            assert!(m.credentials.is_none() && !m.use_mirrors);
+        }
+        assert_eq!(conns.load(Ordering::SeqCst), 0, "no probe");
+        // Docker Hub itself, on the same client, is not touched by it.
+        let c = test_client().with_config(RegistryConfig { insecure: Vec::new(), mirrors: vec![Mirror::parse(&format!("http://{host}")).unwrap()] });
+        assert_eq!(c.for_mirror(&Reference::parse(&format!("{host}/library/alpine:3")).unwrap()).base("registry-1.docker.io"), "https://registry-1.docker.io");
+    }
+
     #[test]
     fn a_redirect_is_made_absolute_against_where_it_came_from() {
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "https://s3.example.com/b?sig=1"), "https://s3.example.com/b?sig=1");
@@ -2969,7 +3028,7 @@ mod tests {
         let https = https.replace("127.0.0.1", "0.0.0.0");
         let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).tls_config(crate::connect::unverified_tls_config()).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
-        let c = Client { agent, credentials: None, config: Default::default(), use_mirrors: true };
+        let c = Client { agent, credentials: None, config: Default::default(), use_mirrors: true, mirror_scheme: None };
         assert!(!c.config.is_unverified(&https));
         let got = c.send_get(&format!("https://{https}/v2/x"), Some("Basic c2VjcmV0"), &[]);
         assert!(got.is_err(), "followed down to plain HTTP: {:?}", got.map(|r| r.status()));
