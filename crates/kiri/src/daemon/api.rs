@@ -341,7 +341,10 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
             ("POST", "attach") => return attach(req, engine, id, w, r),
             ("GET", "logs") => return logs(req, engine, id, w),
             ("POST", "resize") => return reply(w, resize(req, engine, id).map(|()| json!({})), 200),
-            ("POST", "exec") => return reply(w, exec_create(req, engine, id), 201),
+            ("POST", "exec") => {
+                super::builder::before_exec(engine, id);
+                return reply(w, exec_create(req, engine, id), 201);
+            }
             ("HEAD" | "GET", "archive") => return archive_get(req, engine, id, w),
             ("PUT", "archive") => return archive_put(req, engine, id, w, r),
             ("DELETE", "") => return reply(w, engine.remove(id, req.flag("force"), req.flag("v")).map(|()| Value::Null), 204),
@@ -985,9 +988,12 @@ fn set_registries(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
     let (report, changed) = super::daemon_json::set(&body).map_err(Error::BadRequest)?;
     // BuildKit reads its registries from buildkitd.toml at each start; an
-    // unchanged save leaves a running builder alone.
+    // unchanged save leaves a running builder alone. The save answers at
+    // once: stopping the builder, or waiting for one being made, is not the
+    // window's or the CLI's to wait for.
     if changed {
-        super::builder::refresh(engine);
+        let engine = engine.clone();
+        let _ = std::thread::Builder::new().name("kiri-builder-refresh".into()).spawn(move || super::builder::refresh(&engine));
     }
     Ok(report)
 }

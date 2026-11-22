@@ -284,32 +284,98 @@ fn write_config(engine: &Engine, id: &str) {
 /// Applies a changed setting that buildkitd reads from its config (the
 /// registry mirrors and insecure hosts). A builder that is not running reads
 /// the new file when it starts. One that is running with no build and no
-/// `buildx` session under way is stopped with the new file in place, so the
-/// next build starts it with that. A busy one is left as it is, and so is
-/// what [`WRITTEN`] says it runs with: the next build notices the difference
-/// and restarts it then.
+/// `buildx` session under way is stopped, and the new file put in place, so
+/// the next build starts it with that. A busy one is left as it is, and so
+/// is what [`WRITTEN`] says it runs with: the next build, or the idle watch
+/// once it is free, notices the difference and restarts it then. Waits for
+/// a builder being made (its image pulled): the caller runs it off the
+/// request that saved the setting.
 pub fn refresh(engine: &Engine) {
     // The same lock making, starting and stopping the builder take: a build
     // cannot start while its config is being replaced.
     let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
     let Some((id, status)) = find(engine) else { return };
-    let action = refresh_action(status == Status::Running, builder_busy(engine, &id));
-    if action == Refresh::Leave {
+    match refresh_action(status == Status::Running, builder_busy(engine, &id)) {
+        Refresh::Leave => {}
+        Refresh::WriteOnly => write_config(engine, &id),
+        Refresh::WriteAndStop => stop_then_write(engine, &id),
+    }
+}
+
+/// Stops a running builder (resumed first, if Kiri paused it), and only
+/// then writes today's config, into a container nothing runs in: a builder
+/// that would not stop keeps running with what [`WRITTEN`] says it has.
+fn stop_then_write(engine: &Engine, id: &str) {
+    for step in STOP_THEN_WRITE {
+        let done = match step {
+            Step::Resume if engine.is_paused(id) => engine.pause(id, false),
+            Step::Resume => Ok(()),
+            Step::Stop => engine.stop(id, Duration::from_secs(10)).map(|_| ()),
+            Step::Write => {
+                write_config(engine, id);
+                Ok(())
+            }
+        };
+        if let Err(e) = done {
+            crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+            return;
+        }
+    }
+}
+
+/// The steps of [`stop_then_write`], in order.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Step {
+    Resume,
+    Stop,
+    Write,
+}
+const STOP_THEN_WRITE: [Step; 3] = [Step::Resume, Step::Stop, Step::Write];
+
+/// Whether the config the builder runs with is not today's: daemon.json
+/// edited by hand, or a registry in a listed network pulled from, since it
+/// was written.
+fn stale_now(engine: &Engine) -> bool {
+    is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)))
+}
+
+/// Whether a builder is restarted with today's config now: only one that is
+/// running (or paused idle), with nothing using it, and a config not today's.
+fn restart_now(up: bool, busy: bool, stale: bool) -> bool {
+    up && !busy && stale
+}
+
+/// From the idle watch: a builder whose config is not today's, and that
+/// nothing uses, is stopped with today's config in place, so the next
+/// build, buildx's own included, starts it with that. Skipped while the
+/// builder is being made or started.
+fn refresh_if_stale(engine: &Engine) {
+    let _g = match ENSURE.try_lock() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => return,
+    };
+    let Some((id, status)) = find(engine) else { return };
+    if restart_now(status == Status::Running, builder_busy(engine, &id), stale_now(engine)) {
+        stop_then_write(engine, &id);
+    }
+}
+
+/// `POST /containers/<builder>/exec` from buildx (its docker-container
+/// driver talks to buildkitd through an exec): a builder whose config is not
+/// today's, with nothing else using it, is restarted with today's first, so
+/// a build buildx starts reaches each registry as a pull does.
+pub fn before_exec(engine: &Engine, key: &str) {
+    // One lookup for an exec anywhere else.
+    let Ok((id, status, true)) = engine.with(key, |c| (c.id.clone(), c.status, c.name == container_name())) else { return };
+    if !restart_now(status == Status::Running, builder_busy(engine, &id), stale_now(engine)) {
         return;
     }
-    if action == Refresh::WriteOnly {
-        write_config(engine, &id);
-        return;
-    }
-    let before = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    write_config(engine, &id);
-    if engine.is_paused(&id) {
-        let _ = engine.pause(&id, false);
-    }
-    if let Err(e) = engine.stop(&id, Duration::from_secs(10)) {
-        crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
-        // Still running with what it had.
-        *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = before;
+    let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+    stop_then_write(engine, &id);
+    let restarted = engine.start(&id).map_err(|e| format!("{e:?}")).and_then(|()| wait_ready(engine, &id).map_err(|e| format!("{e:?}")));
+    if let Err(e) = restarted {
+        crate::diag::warn!("builder not restarted with today's registries", error = e);
     }
 }
 
@@ -411,13 +477,19 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
         engine.pause(&id, false)?;
     }
     LAST_USE.store(now_secs(), Ordering::Relaxed);
+    wait_ready(engine, &id)?;
+    Ok(id)
+}
+
+/// Waits for a started builder's buildkitd to answer.
+fn wait_ready(engine: &Engine, id: &str) -> Result<(), Error> {
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        if let Ok((0, _)) = engine.exec_capture(&id, &["buildctl", "debug", "workers"]) {
-            return Ok(id);
+        if let Ok((0, _)) = engine.exec_capture(id, &["buildctl", "debug", "workers"]) {
+            return Ok(());
         }
         if find(engine).is_none_or(|(_, s)| s != Status::Running) || Instant::now() > deadline {
-            let text: Vec<u8> = engine.logs(&id, false).ok().flatten().map(|l| l.past.tail(Some(5)).flat_map(|r| r.data).collect()).unwrap_or_default();
+            let text: Vec<u8> = engine.logs(id, false).ok().flatten().map(|l| l.past.tail(Some(5)).flat_map(|r| r.data).collect()).unwrap_or_default();
             let text = String::from_utf8_lossy(&text);
             let tail: Vec<&str> = text.lines().collect();
             return Err(Error::Io(io::Error::other(format!("Kiri's builder (BuildKit) did not start: {}", tail.join(" / ")))));
@@ -440,6 +512,14 @@ pub fn watch(engine: Arc<Engine>) {
             LAST_USE.store(0, Ordering::Relaxed);
             continue;
         };
+        // daemon.json edited by hand, a registry in a listed network pulled
+        // from, or a setting saved while a build ran: the builder is put on
+        // today's config as soon as nothing uses it, running or paused.
+        if refresh_due(&engine, &id) {
+            refresh_if_stale(&engine);
+            LAST_USE.store(0, Ordering::Relaxed);
+            continue;
+        }
         // Paused already: once something resumes it, it gets a full idle
         // time again (counted from the first look at it running).
         if engine.is_paused(&id) {
@@ -465,6 +545,11 @@ pub fn watch(engine: Arc<Engine>) {
         }
         LAST_USE.store(0, Ordering::Relaxed);
     });
+}
+
+/// Whether the idle watch restarts the builder for its config now.
+fn refresh_due(engine: &Engine, id: &str) -> bool {
+    restart_now(true, builder_busy(engine, id), stale_now(engine))
 }
 
 /// A build in progress, for the idle watch.
@@ -1190,6 +1275,19 @@ mod tests {
         // A registry outside the list changes nothing.
         let other = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io"])) };
         assert!(!is_stale(Some(&before), &other));
+    }
+
+    /// A builder on an old config is restarted only when it is up and
+    /// nothing uses it; and it is stopped before its new config is written,
+    /// so one that will not stop keeps what it is recorded as running with.
+    #[test]
+    fn a_stale_builder_is_restarted_only_when_idle_and_stopped_before_its_config_is_written() {
+        assert!(restart_now(true, false, true));
+        assert!(!restart_now(true, true, true), "a build or a buildx session is under way");
+        assert!(!restart_now(false, false, true), "the next start writes today's config");
+        assert!(!restart_now(true, false, false));
+        let at = |s: Step| STOP_THEN_WRITE.iter().position(|x| *x == s).unwrap();
+        assert!(at(Step::Resume) < at(Step::Stop) && at(Step::Stop) < at(Step::Write), "{STOP_THEN_WRITE:?}");
     }
 
     #[test]
