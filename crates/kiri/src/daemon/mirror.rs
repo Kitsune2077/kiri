@@ -197,14 +197,25 @@ const MAX_SEEN: usize = 256;
 /// `now` (the store's registries) with those [`SEEN`] before, Docker Hub
 /// first; `now` is remembered too.
 fn remembered(now: Vec<String>) -> Vec<String> {
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    for r in now {
-        if !seen.contains(&r) && seen.len() < MAX_SEEN {
-            seen.push(r);
+    remembered_in(&mut SEEN.lock().unwrap_or_else(|e| e.into_inner()), now)
+}
+
+/// [`remembered`] with `seen` as the memory. Every registry in `now` is
+/// always in the answer; past [`MAX_SEEN`] the oldest of those no longer
+/// in the store are forgotten. Docker Hub is always there, and takes no
+/// place in the memory.
+fn remembered_in(seen: &mut Vec<String>, now: Vec<String>) -> Vec<String> {
+    for r in &now {
+        if r != "docker.io" && !seen.contains(r) {
+            seen.push(r.clone());
         }
     }
+    while seen.len() > MAX_SEEN {
+        let Some(i) = seen.iter().position(|r| !now.contains(r)) else { break };
+        seen.remove(i);
+    }
     let mut names = vec!["docker.io".to_owned()];
-    names.extend(seen.iter().filter(|r| r.as_str() != "docker.io").cloned());
+    names.extend(seen.iter().cloned());
     names
 }
 
@@ -403,6 +414,23 @@ mod tests {
     /// every host a pull reaches unverified is http and insecure in builds
     /// too, a network covers the registries the store names inside it, and
     /// nothing else changes.
+    /// However many registries were seen before, every one the store names
+    /// now has its table; the oldest gone from the store make room.
+    #[test]
+    fn a_full_memory_still_takes_the_stores_registries() {
+        let mut seen = Vec::new();
+        // One image at a time, each removed before the next is pulled.
+        for i in 0..MAX_SEEN + 40 {
+            remembered_in(&mut seen, vec![format!("old-{i}.lan:5000")]);
+        }
+        assert_eq!(seen.len(), MAX_SEEN);
+        let names = remembered_in(&mut seen, vec!["docker.io".into(), "new.lan:5000".into()]);
+        assert!(names.contains(&"new.lan:5000".to_owned()), "the new registry has its table");
+        assert_eq!(names.iter().filter(|n| *n == "docker.io").count(), 1);
+        assert!(seen.len() <= MAX_SEEN && !seen.contains(&"docker.io".to_owned()));
+        assert!(!seen.contains(&"old-40.lan:5000".to_owned()) && seen.contains(&format!("old-{}.lan:5000", MAX_SEEN + 39)), "the oldest went");
+    }
+
     #[test]
     fn daemon_json_registries_share_one_table_each() {
         let c = kiri_image::RegistryConfig {
