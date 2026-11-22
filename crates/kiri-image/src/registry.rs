@@ -524,7 +524,11 @@ fn basic_login_target(final_url: &str, url: &str) -> Option<String> {
 /// it has none): what must all match for a request to stay "the same place".
 fn origin_of(url: &str) -> Option<(bool, String, u16)> {
     let uri: ureq::http::Uri = url.parse().ok()?;
-    let https = uri.scheme_str()?.eq_ignore_ascii_case("https");
+    let https = match uri.scheme_str()?.to_ascii_lowercase().as_str() {
+        "https" => true,
+        "http" => false,
+        _ => return None,
+    };
     let host = uri.host()?;
     // One spelling per host: `[fd00:0::1]` and `[fd00::1]` are one address.
     let host = crate::config::canonical(host).unwrap_or_else(|| host.to_ascii_lowercase());
@@ -769,6 +773,9 @@ fn insecure_scheme(host: &str) -> &'static str {
     let answers = |url: String, agent: ureq::Agent| agent.get(&url).config().timeout_global(Some(Duration::from_secs(10))).build().call().map(drain).is_ok();
     let (scheme, ttl) = if answers(format!("https://{host}/v2/"), insecure_agent()) {
         ("https", SCHEME_TTL)
+    } else if crate::cancel::current_cancelled() {
+        // Stopped during the first probe: the second is not started.
+        return "https";
     } else if answers(format!("http://{host}/v2/"), shared_agent()) {
         ("http", SCHEME_TTL)
     } else if crate::cancel::current_cancelled() {
@@ -1729,8 +1736,13 @@ fn login_host(server: &str) -> Result<String, Error> {
         return Err(Error::Http(format!("not a registry address: {text}")));
     }
     let host = rest.split('/').next().unwrap_or_default();
-    if host.is_empty() || crate::config::is_hub(host) {
+    // No server at all is Docker Hub; a scheme or a path with no host is no
+    // server.
+    if lower.is_empty() || crate::config::is_hub(host) {
         return Ok("registry-1.docker.io".into());
+    }
+    if host.is_empty() {
+        return Err(Error::Http(format!("not a registry address: {text}")));
     }
     crate::config::canonical(host).ok_or_else(|| Error::Http(format!("not a registry address: {text}")))
 }
@@ -3091,6 +3103,38 @@ mod tests {
         assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
     }
 
+    /// Only http and https URLs have an origin to compare.
+    #[test]
+    fn another_scheme_has_no_origin() {
+        assert_eq!(origin_of("http://r.lan/v2/"), Some((false, "r.lan".into(), 80)));
+        assert_eq!(origin_of("ftp://r.lan/v2/"), None);
+        assert_eq!(origin_of("ws://r.lan/v2/"), None);
+        assert!(!is_own_origin("ftp://r.lan/v2/", "ftp://r.lan/v2/"));
+    }
+
+    /// A pull stopped while the HTTPS probe runs does not go on to try
+    /// plain HTTP: the host is connected to once.
+    #[test]
+    fn a_cancelled_scheme_probe_stops_after_https() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = accepted.clone();
+        std::thread::spawn(move || {
+            for c in listener.incoming() {
+                count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                drop(c);
+            }
+        });
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let _on = cancel.enter();
+        assert_eq!(insecure_scheme(&host), "https");
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) <= 1, "{}", accepted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(remembered_scheme(&host), None, "nothing learnt about it");
+    }
+
     #[test]
     fn an_upgrade_to_https_on_the_same_host_is_the_registrys_own() {
         // Up from http on the same host: default ports, or the same explicit port.
@@ -3263,7 +3307,7 @@ mod tests {
         ] {
             assert_eq!(login_host(server).unwrap(), host, "{server}");
         }
-        for bad in ["10.0.0.1:@registry-1.docker.io", "10.0.0.1:@ghcr.io", "user@registry.lan", "registry.lan?x=1", "registry.lan#x", "registry.lan:+5000", "a..b"] {
+        for bad in ["10.0.0.1:@registry-1.docker.io", "10.0.0.1:@ghcr.io", "user@registry.lan", "registry.lan?x=1", "registry.lan#x", "registry.lan:+5000", "a..b", "https://", "http:///v2/", "/foo"] {
             assert!(login_host(bad).is_err(), "{bad}");
         }
     }
