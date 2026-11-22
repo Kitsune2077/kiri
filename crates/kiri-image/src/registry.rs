@@ -433,6 +433,21 @@ fn url_host(url: &str) -> Option<String> {
     url.parse::<ureq::http::Uri>().ok()?.authority().map(|a| a.as_str().rsplit('@').next().unwrap_or_default().to_ascii_lowercase())
 }
 
+/// A `host[:port]`'s port, 80 (plain HTTP's) when it names none.
+fn port_of(host: &str) -> u16 {
+    if host.ends_with(']') {
+        return 80;
+    }
+    host.rsplit_once(':').map_or(Some(80), |(_, p)| p.parse().ok()).unwrap_or(0)
+}
+
+/// Whether a `host[:port]` is this machine by address or as `localhost`
+/// itself, which resolve here without asking a name server.
+fn is_loopback(host: &str) -> bool {
+    let name = if host.starts_with('[') { host.split(']').next().unwrap_or(host).trim_start_matches('[') } else { host.split(':').next().unwrap_or(host) };
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
 fn is_https(url: &str) -> bool {
     url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
 }
@@ -824,9 +839,12 @@ impl Client {
 
     /// Whether a token `realm` the registry named may be asked: over HTTPS,
     /// or over plain HTTP only on the insecure registry's own host and port
-    /// (a registry on plain HTTP names its own address for tokens), or on
-    /// this machine for a registry on this machine. Never in the clear to
-    /// another host, listed or not, and never because of a network entry.
+    /// (a registry on plain HTTP names its own address for tokens). For a
+    /// registry on this machine its own port on this machine counts as its
+    /// own, however the realm spells loopback (`localhost`, `127.0.0.1`,
+    /// `[::1]`); a name under `.localhost` does not, as a resolver may send
+    /// it to DNS. Never in the clear to another host or port, listed or not,
+    /// and never because of a network entry.
     fn realm_is_secure(&self, realm: &str, registry: &str) -> bool {
         if is_https(realm) {
             return true;
@@ -836,7 +854,7 @@ impl Client {
         }
         let Some(host) = url_host(realm) else { return false };
         let same = crate::config::canonical(&host).is_some_and(|h| Some(h) == crate::config::canonical(registry));
-        let local = crate::reference::is_local(&host) && crate::reference::is_local(registry);
+        let local = is_loopback(&host) && crate::reference::is_local(registry) && port_of(&host) == port_of(registry);
         self.config.is_unverified(registry) && !crate::config::is_hub(&host) && (same || local)
     }
 
@@ -2195,11 +2213,17 @@ mod tests {
         assert!(c.realm_is_secure("https://auth.example.com/token", "registry.example.com"));
         assert!(c.realm_is_secure("http://127.0.0.1:5000/token", "localhost:5000"));
         assert!(c.realm_is_secure("http://[::1]:5000/token", "localhost:5000"));
+        assert!(c.realm_is_secure("http://localhost/token", "127.0.0.1"));
         for (realm, registry) in [
             ("http://auth.example.com/token", "registry.example.com"),
             ("http://auth.example.com/token", "localhost:5000"),
             ("http://127.evil.com/token", "127.evil.com"),
             ("http://192.168.1.10/token", "localhost:5000"),
+            // Another port on this machine, or a .localhost name a resolver
+            // may send to DNS.
+            ("http://127.0.0.1:8080/token", "localhost:5000"),
+            ("http://localhost/token", "localhost:5000"),
+            ("http://auth.localhost:5000/token", "localhost:5000"),
         ] {
             assert!(!c.realm_is_secure(realm, registry), "{realm} for {registry}");
         }

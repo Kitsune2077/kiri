@@ -68,7 +68,7 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   mirror that fails mid-pull, or serves an image for another platform,
   hands the pull to the next mirror and then Docker Hub, and an image a
   mirror served records which; a plain-HTTP token service is asked only
-  on the registry's own host; and no redirect goes from HTTPS down to
+  on the registry's own host and port; and no redirect goes from HTTPS down to
   plain HTTP except to a listed host. The lists are changed from this
   machine only (the window, `kiri registry` or the file), never from a
   container given the engine's socket. A daemon.json larger than
