@@ -53,12 +53,15 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   `insecure-registries` (hosts such as `registry.lan:5000`, or networks
   such as `10.0.0.0/8`, reached with a self-signed certificate or plain
   HTTP: HTTPS without checking the certificate first, then HTTP) and
-  `registry-mirrors` (Docker Hub pull-through mirrors, tried in order).
+  `registry-mirrors` (Docker Hub pull-through mirrors, tried in order,
+  each over the scheme it is written with: `http://` straight over plain
+  HTTP, `https://` never down to it, as in Docker).
   They apply to `pull`, `push`, `login` and `build`, only for the hosts
   listed, and an edit applies without a restart. Docker Hub is always
   reached directly over verified HTTPS, whatever the file lists or its
-  name resolves to, and a registry on this machine (loopback) is tried
-  over HTTPS without a certificate check, then HTTP, as in Docker. Where
+  name resolves to, and a registry on this machine (`localhost` or a
+  loopback address; not a name under `.localhost`) is tried over HTTPS
+  without a certificate check, then HTTP, as in Docker. Where
   Kiri is stricter than Docker: a network covers registries named by an
   address in it (`10.1.2.3:5000`), not host names that resolve into it
   (list those by name), and must be a private range or a small one (a

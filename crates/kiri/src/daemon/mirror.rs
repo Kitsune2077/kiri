@@ -142,11 +142,12 @@ pub fn host_addr(engine: &Engine) -> String {
     mirror_host(&engine.lock_net())
 }
 
-/// One `[registry."host"]` table of buildkitd.toml.
+/// One `[registry."host"]` table of buildkitd.toml. `http` unset leaves
+/// BuildKit's default (plain HTTP for `localhost`, HTTPS for the rest).
 #[derive(Default, Debug, PartialEq)]
 struct Table {
     mirrors: Vec<String>,
-    http: bool,
+    http: Option<bool>,
     insecure: bool,
 }
 
@@ -239,7 +240,7 @@ pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String])
         for name in names {
             add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
         }
-        table(&mut tables, &host).http = true;
+        table(&mut tables, &host).http = Some(true);
     }
     registries(&mut tables, c, names);
     let mut out = String::new();
@@ -249,8 +250,8 @@ pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String])
             let list = t.mirrors.iter().map(|m| format!("\"{m}\"")).collect::<Vec<_>>().join(", ");
             out.push_str(&format!("  mirrors = [{list}]\n"));
         }
-        if t.http {
-            out.push_str("  http = true\n");
+        if let Some(http) = t.http {
+            out.push_str(&format!("  http = {http}\n"));
         }
         if t.insecure {
             out.push_str("  insecure = true\n");
@@ -263,31 +264,57 @@ pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String])
 /// the way a pull does. Its Docker Hub mirrors (the usable ones:
 /// `RegistryConfig::mirror_allowed`) come after Kiri's own mirror, which
 /// serves images built or loaded here and answers 404 for everything else.
-/// Every host a pull reaches without verified TLS (a listed host, a mirror
-/// on one, a registry the store's images name inside a listed network) is
-/// `http` and `insecure`, as Docker sets them for its builder: BuildKit then
-/// tries HTTPS without checking the certificate, then HTTP, as a pull does.
-/// Every other host keeps verified HTTPS, a plain-HTTP mirror's host
-/// included (such a mirror is used only when its host is listed). BuildKit
-/// has no network form, so a network reaches builds through the registries
-/// in `known` (the store's), and a listed host's own table.
+///
+/// BuildKit (util/resolver) reads `http` and `insecure` together: both set
+/// is HTTPS without a certificate check, falling back to plain HTTP when
+/// the answer is not TLS, which is what a pull does for a host it probes
+/// (a listed host, a registry the store names inside a listed network);
+/// `http` alone is plain HTTP only; `insecure` alone (with `http = false`,
+/// so `localhost` is not sent plain HTTP by default) is unchecked HTTPS
+/// only. A mirror is asked over the scheme it was written with, as a pull
+/// asks it: `http://` gets `http` alone, `https://` on a host that may go
+/// unverified gets `insecure` alone, and one elsewhere keeps verified
+/// HTTPS. A host two mirrors name with different schemes is probed. Every
+/// other host keeps verified HTTPS, a plain-HTTP mirror's host included
+/// (such a mirror is used only when its host is listed). BuildKit has no
+/// network form, so a network reaches builds through the registries in
+/// `known` (the store's), and a listed host's own table.
 fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig, known: &[String]) {
-    let mut unverified: Vec<&str> = Vec::new();
+    // Each mirror host and its written scheme (`Some(http)`), `None` where
+    // two mirrors on it disagree.
+    let mut schemes: Vec<(&str, Option<bool>)> = Vec::new();
     for mirror in c.usable_mirrors() {
         add_mirror(tables, "docker.io", mirror.buildkit());
-        unverified.push(&mirror.host);
-    }
-    for e in &c.insecure {
-        if let kiri_image::Insecure::Host(h) = e {
-            unverified.push(h);
+        match schemes.iter_mut().find(|(h, _)| *h == mirror.host) {
+            Some((_, s)) if *s != Some(mirror.http) => *s = None,
+            Some(_) => {}
+            None => schemes.push((&mirror.host, Some(mirror.http))),
         }
     }
-    unverified.extend(known.iter().map(String::as_str));
-    for host in unverified {
-        if c.is_unverified(host) {
-            let t = table(tables, host);
-            t.http = true;
-            t.insecure = true;
+    let probed = |t: &mut Table| {
+        t.http = Some(true);
+        t.insecure = true;
+    };
+    for (host, scheme) in &schemes {
+        match scheme {
+            Some(true) => table(tables, host).http = Some(true),
+            Some(false) if c.is_unverified(host) => {
+                let t = table(tables, host);
+                t.http = Some(false);
+                t.insecure = true;
+            }
+            Some(false) => {}
+            None if c.is_unverified(host) => probed(table(tables, host)),
+            None => {}
+        }
+    }
+    let listed = c.insecure.iter().filter_map(|e| match e {
+        kiri_image::Insecure::Host(h) => Some(h.as_str()),
+        kiri_image::Insecure::Net(..) => None,
+    });
+    for host in listed.chain(known.iter().map(String::as_str)) {
+        if c.is_unverified(host) && !schemes.iter().any(|(h, _)| *h == host) {
+            probed(table(tables, host));
         }
     }
 }
@@ -443,12 +470,36 @@ mod tests {
         let names: Vec<&str> = tables.iter().map(|(r, _)| r.as_str()).collect();
         assert_eq!(names, ["docker.io", "mirror.lan:5000", "registry.lan:5000", "10.1.2.3:5000"]);
         assert_eq!(tables[0].1.mirrors, ["198.19.248.254:1234/t/docker.io", "mirror.lan:5000", "m.example.com/docker.io"]);
-        for t in &tables[1..] {
-            assert_eq!(t.1, Table { mirrors: vec![], http: true, insecure: true });
+        // The http:// mirror straight over plain HTTP, as a pull asks it.
+        assert_eq!(tables[1].1, Table { mirrors: vec![], http: Some(true), insecure: false });
+        for t in &tables[2..] {
+            assert_eq!(t.1, Table { mirrors: vec![], http: Some(true), insecure: true });
         }
         let mut none = Vec::new();
         registries(&mut none, &kiri_image::RegistryConfig::default(), &["ghcr.io".into()]);
         assert!(none.is_empty());
+    }
+
+    /// A mirror is reached in builds over the scheme it was written with,
+    /// as a pull reaches it: an https:// one on a listed host or on this
+    /// machine is unchecked HTTPS with no fall back to plain HTTP, an
+    /// http:// one plain HTTP with no TLS first, an https:// one elsewhere
+    /// verified HTTPS. A listed host with no scheme is probed (both set).
+    #[test]
+    fn a_build_reaches_a_mirror_over_its_written_scheme() {
+        let c = kiri_image::RegistryConfig {
+            insecure: ["tls.lan:5000", "plain.lan:5000", "both.lan:5000", "reg.lan:5000"].iter().map(|e| kiri_image::Insecure::parse(e).unwrap()).collect(),
+            mirrors: ["https://tls.lan:5000", "http://plain.lan:5000", "https://127.0.0.1:5000", "https://m.example.com", "https://both.lan:5000/a", "http://both.lan:5000/b"].iter().map(|m| kiri_image::Mirror::parse(m).unwrap()).collect(),
+        };
+        let mut tables = Vec::new();
+        registries(&mut tables, &c, &[]);
+        let get = |h: &str| tables.iter().find(|(r, _)| r == h).map(|(_, t)| (t.http, t.insecure));
+        assert_eq!(get("tls.lan:5000"), Some((Some(false), true)));
+        assert_eq!(get("127.0.0.1:5000"), Some((Some(false), true)));
+        assert_eq!(get("plain.lan:5000"), Some((Some(true), false)));
+        assert_eq!(get("both.lan:5000"), Some((Some(true), true)));
+        assert_eq!(get("reg.lan:5000"), Some((Some(true), true)));
+        assert_eq!(get("m.example.com"), None);
     }
 
     /// A plain-HTTP mirror on a host nobody listed: a pull does not use it,
