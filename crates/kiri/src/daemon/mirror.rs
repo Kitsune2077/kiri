@@ -172,8 +172,9 @@ fn add_mirror(tables: &mut Vec<(String, Table)>, registry: &str, mirror: String)
     }
 }
 
-pub fn config(engine: &Engine) -> String {
-    let mut tables: Vec<(String, Table)> = Vec::new();
+/// The registries buildkitd.toml has tables for: Docker Hub, and each one
+/// an image in the store came from (not this machine's).
+pub fn registry_names(engine: &Engine) -> Vec<String> {
     let mut names = vec!["docker.io".to_owned()];
     for i in engine.store.images().unwrap_or_default() {
         if let Ok(r) = Reference::parse(&i.name)
@@ -183,15 +184,31 @@ pub fn config(engine: &Engine) -> String {
             names.push(r.registry);
         }
     }
+    names
+}
+
+/// Those of `names` reached without verified TLS by `c`: what buildkitd.toml
+/// marks `http` and `insecure` beyond the hosts `c` names itself (a network
+/// entry covers a registry only once an image from it is in the store).
+pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = names.iter().filter(|n| c.is_unverified(n)).cloned().collect();
+    out.sort();
+    out
+}
+
+/// buildkitd.toml's registry tables, for `c` (daemon.json's settings) and
+/// `names` ([`registry_names`]).
+pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String]) -> String {
+    let mut tables: Vec<(String, Table)> = Vec::new();
     if let Some(port) = LISTENING.get().copied().flatten() {
         let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
         let token = token();
-        for name in &names {
+        for name in names {
             add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
         }
         table(&mut tables, &host).http = true;
     }
-    registries(&mut tables, &super::daemon_json::current(), &names);
+    registries(&mut tables, c, names);
     let mut out = String::new();
     for (registry, t) in tables {
         out.push_str(&format!("[registry.\"{registry}\"]\n"));

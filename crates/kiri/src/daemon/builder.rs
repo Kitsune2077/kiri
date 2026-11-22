@@ -234,24 +234,45 @@ pub fn before_start(engine: &Engine, key: &str) {
     write_config(engine, &id);
 }
 
-/// daemon.json's registry settings as the builder's config last had them,
-/// so a hand edit reaches a running builder at the next build. `None` until
-/// this daemon has written the file: a builder found running then (left from
-/// before the daemon started) may have anything, and is treated as stale.
-static WRITTEN: std::sync::Mutex<Option<std::sync::Arc<kiri_image::RegistryConfig>>> = std::sync::Mutex::new(None);
+/// What the builder's registry tables come from: daemon.json's settings,
+/// and the registries the store's images came from that those settings
+/// reach without verified TLS (a network entry covers a registry only once
+/// an image from it is pulled).
+#[derive(Debug, PartialEq)]
+struct Registries {
+    config: std::sync::Arc<kiri_image::RegistryConfig>,
+    unverified: Vec<String>,
+}
+
+impl Registries {
+    fn now(names: &[String]) -> Registries {
+        let config = super::daemon_json::current();
+        let unverified = super::mirror::unverified(&config, names);
+        Registries { config, unverified }
+    }
+}
+
+/// [`Registries`] as the builder's config last had them, so a hand edit, or
+/// an image pulled from a registry inside a listed network, reaches a
+/// running builder at the next build. `None` until this daemon has written
+/// the file: a builder found running then (left from before the daemon
+/// started) may have anything, and is treated as stale.
+static WRITTEN: std::sync::Mutex<Option<std::sync::Arc<Registries>>> = std::sync::Mutex::new(None);
 
 /// Whether a running builder's registry settings are not today's.
-fn is_stale(written: Option<&kiri_image::RegistryConfig>, current: &kiri_image::RegistryConfig) -> bool {
+fn is_stale(written: Option<&Registries>, current: &Registries) -> bool {
     written.is_none_or(|w| w != current)
 }
 
 /// The garbage collector's limits and the registries, for buildkitd's next
 /// start. [`WRITTEN`] says so only once the file is in place.
 fn write_config(engine: &Engine, id: &str) {
-    let current = super::daemon_json::current();
-    let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(config_toml(cache_limit(), &super::mirror::config(engine)).as_bytes()))]);
+    let names = super::mirror::registry_names(engine);
+    let current = Registries::now(&names);
+    let toml = config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names));
+    let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(toml.as_bytes()))]);
     let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
-    *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then_some(current);
+    *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then(|| std::sync::Arc::new(current));
     if let Err(e) = written {
         crate::diag::warn!("builder config not written", error = format!("{e:?}"));
     }
@@ -373,7 +394,9 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
     // daemon.json edited by hand since the builder started (Settings and
     // `kiri registry` refresh it at once): restarted with the new file
     // while no build uses it, as buildkitd reads it only when it starts.
-    let stale = status == Status::Running && !builder_busy(engine, &id) && is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &super::daemon_json::current());
+    let stale = status == Status::Running
+        && !builder_busy(engine, &id)
+        && is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &Registries::now(&super::mirror::registry_names(engine)));
     if stale {
         if engine.is_paused(&id) {
             engine.pause(&id, false)?;
@@ -1146,11 +1169,27 @@ mod tests {
     /// its recorded config is not advanced.
     #[test]
     fn a_builder_whose_config_is_unknown_or_old_is_stale() {
-        let none = kiri_image::RegistryConfig::default();
-        let some = kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("registry.lan:5000").unwrap()], ..Default::default() };
+        let r = |c: kiri_image::RegistryConfig, unverified: &[&str]| Registries { config: std::sync::Arc::new(c), unverified: unverified.iter().map(|s| s.to_string()).collect() };
+        let none = r(kiri_image::RegistryConfig::default(), &[]);
+        let some = r(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("registry.lan:5000").unwrap()], ..Default::default() }, &[]);
         assert!(is_stale(None, &none), "never written by this daemon");
         assert!(is_stale(Some(&none), &some));
         assert!(!is_stale(Some(&some), &some));
+    }
+
+    /// An image pulled from a registry inside a listed network, after the
+    /// builder started, makes it stale: its config has no table for it.
+    #[test]
+    fn a_registry_pulled_from_inside_a_listed_network_makes_the_builder_stale() {
+        let c = std::sync::Arc::new(kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("10.0.0.0/8").unwrap()], ..Default::default() });
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let before = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io"])) };
+        let after = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io", "10.1.2.3:5000"])) };
+        assert_eq!(after.unverified, ["10.1.2.3:5000"]);
+        assert!(is_stale(Some(&before), &after));
+        // A registry outside the list changes nothing.
+        let other = Registries { config: c.clone(), unverified: super::super::mirror::unverified(&c, &names(&["docker.io", "ghcr.io"])) };
+        assert!(!is_stale(Some(&before), &other));
     }
 
     #[test]
