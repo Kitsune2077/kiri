@@ -468,10 +468,15 @@ fn joined(from: &str, location: &str) -> String {
     }
 }
 
-/// Where a response finally came from, set on those [`Client::get_following`]
-/// followed itself (ureq records it for the ones it followed).
+/// Where a response finally came from, set by [`Client::get_following`]
+/// (the request's own URL when it was not redirected).
 #[derive(Clone)]
 struct FinalUrl(String);
+
+/// A status that sends the request elsewhere.
+fn is_redirect(status: u16) -> bool {
+    matches!(status, 301 | 302 | 303 | 307 | 308)
+}
 
 fn final_url(resp: &ureq::http::Response<ureq::Body>) -> Option<String> {
     use ureq::ResponseExt;
@@ -506,7 +511,10 @@ fn origin_of(url: &str) -> Option<(bool, String, u16)> {
 const IDLE: Duration = Duration::from_secs(90);
 
 /// The process's one agent, so its connection pool outlives a pull. It is
-/// built again only when the proxy settings change.
+/// built again only when the proxy settings change. Like the insecure one,
+/// it follows no redirect itself: [`Client::get_following`] does, so every
+/// hop is checked (never from HTTPS down to plain HTTP to a host the list
+/// does not allow, credentials only to the origin first asked).
 fn shared_agent() -> ureq::Agent {
     static AGENT: Mutex<Option<(ProxyChoice, ureq::Agent)>> = Mutex::new(None);
     cached_agent(&AGENT, false)
@@ -538,11 +546,13 @@ fn cached_agent(slot: &Mutex<Option<(ProxyChoice, ureq::Agent)>>, insecure: bool
         // and one to its CDN; keep them all for the next pull.
         .max_idle_connections(32)
         .max_idle_connections_per_host(PARALLEL_LAYERS * 2)
-        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")));
+        .user_agent(concat!("kiri/", env!("CARGO_PKG_VERSION")))
+        // Redirects are followed by hand, hop by hop ([`Client::get_following`]).
+        .max_redirects(0);
     // A listed host's certificate is not checked, as Docker reaches an
     // insecure registry; every other agent keeps ureq's verified TLS.
     if insecure {
-        cfg = cfg.tls_config(crate::connect::unverified_tls_config()).max_redirects(0);
+        cfg = cfg.tls_config(crate::connect::unverified_tls_config());
     }
     if let Some(p) = proxy(chosen.clone()) {
         cfg = cfg.proxy(p);
@@ -1232,23 +1242,10 @@ impl Client {
         ok(resp, url)
     }
 
-    /// GET `url` with `headers`, and `auth` as its `Authorization`. The
-    /// verified agent follows redirects itself (without the header, ureq's
-    /// rule). The insecure one follows none, so [`Client::get_following`]
-    /// does, when a registry is on this machine or listed.
+    /// GET `url` with `headers`, and `auth` as its `Authorization`, its
+    /// redirects followed by [`Client::get_following`]: no agent follows
+    /// one itself.
     fn send_get(&self, url: &str, auth: Option<&str>, headers: &[(&str, String)]) -> Result<ureq::http::Response<ureq::Body>, ureq::Error> {
-        // Nothing listed and nothing on this machine over HTTPS (the usual
-        // case): one call on the shared agent, as before there was a list.
-        if self.config.insecure.is_empty() && !(is_https(url) && url_host(url).is_some_and(|h| crate::reference::is_local(&h))) {
-            let mut req = self.agent.get(url);
-            for (k, v) in headers {
-                req = req.header(*k, v);
-            }
-            if let Some(a) = auth {
-                req = req.header("Authorization", a);
-            }
-            return req.call();
-        }
         let owner = url_host(url).unwrap_or_default();
         self.get_following(url, &owner, auth, headers, &[])
     }
@@ -1273,7 +1270,7 @@ impl Client {
     }
 
     /// GET `url` for a request that `owner` caused, following redirects by
-    /// hand where the agent follows none: each hop on the agent its own
+    /// hand (no agent follows one itself): each hop on the agent its own
     /// host calls for (a blob redirected from a listed host to a storage
     /// server is fetched verified), `auth` only to the origin first asked
     /// (see [`Client::hop`]). `query` goes on the first request only.
@@ -1295,16 +1292,11 @@ impl Client {
             if let Some(a) = auth.filter(|_| keep_auth) {
                 req = req.header("Authorization", a);
             }
-            let resp = req.call()?;
-            let redirect = matches!(resp.status().as_u16(), 301 | 302 | 303 | 307 | 308) && agent.config().max_redirects() == 0;
+            let mut resp = req.call()?;
+            let redirect = is_redirect(resp.status().as_u16());
             let location = redirect.then(|| resp.headers().get("location").and_then(|v| v.to_str().ok()).map(str::to_owned)).flatten();
             let Some(location) = location else {
-                let mut resp = resp;
-                // Only for hops followed here: a verified agent that followed
-                // redirects itself knows where it ended up (ureq records it).
-                if agent.config().max_redirects() == 0 {
-                    resp.extensions_mut().insert(FinalUrl(url));
-                }
+                resp.extensions_mut().insert(FinalUrl(url));
                 return Ok(resp);
             };
             drain(resp);
@@ -1426,7 +1418,7 @@ impl Client {
     /// `docker search`, against Docker Hub's search API.
     pub fn search(&self, term: &str, limit: u32) -> Result<Vec<serde_json::Value>, Error> {
         let url = "https://index.docker.io/v1/search";
-        let mut resp = self.agent.get(url).query("q", term).query("n", &limit.to_string()).call()?;
+        let mut resp = self.agent.get(url).query("q", term).query("n", limit.to_string()).config().max_redirects(5).https_only(true).build().call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url: url.to_owned(), status: resp.status().as_u16(), body: String::new() });
         }
@@ -1440,7 +1432,7 @@ impl Client {
     pub fn hub_tags(&self, repo: &str, limit: u32) -> Result<Vec<String>, Error> {
         let repo = if repo.contains('/') { repo.to_owned() } else { format!("library/{repo}") };
         let url = format!("https://hub.docker.com/v2/repositories/{repo}/tags");
-        let mut resp = self.agent.get(&url).query("page_size", &limit.to_string()).query("ordering", "last_updated").call()?;
+        let mut resp = self.agent.get(&url).query("page_size", limit.to_string()).query("ordering", "last_updated").config().max_redirects(5).https_only(true).build().call()?;
         if resp.status().as_u16() != 200 {
             return Err(Error::Status { url, status: resp.status().as_u16(), body: String::new() });
         }
@@ -1559,7 +1551,9 @@ impl Client {
                 }
                 req.call()
             })?;
-            if head.status().as_u16() == 200 {
+            // A redirect sends the HEAD on to where the registry keeps the
+            // blob: it has it.
+            if head.status().as_u16() == 200 || is_redirect(head.status().as_u16()) {
                 progress(PushProgress::Exists { digest: digest.clone() });
                 continue;
             }
@@ -2182,7 +2176,7 @@ mod tests {
     }
 
     fn test_client() -> Client {
-        let cfg = ureq::Agent::config_builder().http_status_as_error(false).build();
+        let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).build();
         let agent = ureq::Agent::with_parts(cfg, crate::connect::connector_with(Duration::from_millis(300)), ureq::unversioned::resolver::DefaultResolver::default());
         Client { agent, credentials: None, config: Default::default(), use_mirrors: true }
     }
