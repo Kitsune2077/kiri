@@ -197,37 +197,62 @@ const VM_ENGINE_SOCK: &str = "/run/host-services/docker.sock";
 /// mounts into Ryuk).
 const ENGINE_SOCKS: &[&str] = &["/var/run/docker.sock", "/run/docker.sock", "/private/var/run/docker.sock"];
 
+/// Where a path really is: its links followed, and the file it leads to
+/// as device and inode, which also matches a hard link or another mount of
+/// the same file.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Real {
+    pub path: String,
+    pub id: (u64, u64),
+}
+
+impl Real {
+    /// The same file as `other`, by path or by device and inode.
+    pub fn same(&self, other: &Real) -> bool {
+        self.path == other.path || self.id == other.id
+    }
+}
+
+/// [`Real`] for a path that exists, `None` for one that does not.
+pub fn real(p: &str) -> Option<Real> {
+    use std::os::unix::fs::MetadataExt;
+    let path = std::fs::canonicalize(p).ok()?;
+    let m = std::fs::metadata(&path).ok()?;
+    Some(Real { path: path.into_os_string().into_string().ok()?, id: (m.dev(), m.ino()) })
+}
+
 /// What to mount for a bind of `src`, when it is the engine's socket. On a
 /// Mac the VM's relay to this daemon, as Docker Desktop and OrbStack give
 /// the VM's engine. On a Linux host (and WSL) the socket Kiri gives
-/// containers (caller.rs) for a path that is Kiri's socket, by any name or
-/// link (the package's `/var/run/docker.sock` link among them), and for a
-/// missing `/var/run/docker.sock` rather than a new empty directory. Another
-/// engine's socket at that path (Docker's own) is mounted as it is.
+/// containers (caller.rs) for a path that is Kiri's socket, by any name,
+/// link or hard link (the package's `/var/run/docker.sock` link among
+/// them), and for a missing `/var/run/docker.sock` rather than a new empty
+/// directory. Another engine's socket at that path (Docker's own) is
+/// mounted as it is.
 pub fn engine_socket(src: &str) -> Option<String> {
     let own = super::socket_path().ok()?;
     let own = own.to_string_lossy();
-    engine_socket_for(src, &own, |p| std::fs::canonicalize(p).ok().map(|p| p.to_string_lossy().into_owned()))
+    engine_socket_for(src, &own, real)
 }
 
-/// [`engine_socket`], with `resolve` giving the real path of a path that
-/// exists (links followed), `None` for one that does not.
-fn engine_socket_for(src: &str, own: &str, resolve: impl Fn(&str) -> Option<String>) -> Option<String> {
-    let src = clean(src);
+/// [`engine_socket`], with `resolve` giving where a path that exists
+/// really is. The path as given is followed first, as the kernel will
+/// follow it; only a path that is not there is compared as text.
+fn engine_socket_for(src: &str, own: &str, resolve: impl Fn(&str) -> Option<Real>) -> Option<String> {
+    let found = resolve(src);
+    let is_own = found.as_ref().zip(resolve(own)).is_some_and(|(a, b)| a.same(&b));
+    let text = clean(src);
     #[cfg(target_os = "macos")]
     {
-        let _ = resolve;
-        (ENGINE_SOCKS.contains(&src.as_str()) || src == own).then(|| VM_ENGINE_SOCK.to_owned())
+        let named = ENGINE_SOCKS.contains(&text.as_str()) || found.as_ref().is_some_and(|r| ENGINE_SOCKS.contains(&r.path.as_str()));
+        (is_own || named || text == clean(own)).then(|| VM_ENGINE_SOCK.to_owned())
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let for_containers = || super::caller::container_socket(Path::new(own)).to_string_lossy().into_owned();
-        if src == clean(own) {
-            return Some(for_containers());
-        }
-        match resolve(&src) {
-            None => ENGINE_SOCKS.contains(&src.as_str()).then(for_containers),
-            Some(real) => (Some(real) == resolve(own)).then(for_containers),
+        let given = || super::caller::container_socket(Path::new(own)).to_string_lossy().into_owned();
+        match found {
+            Some(_) => is_own.then(given),
+            None => (text == clean(own) || ENGINE_SOCKS.contains(&text.as_str())).then(given),
         }
     }
 }
@@ -429,34 +454,68 @@ mod tests {
         assert!(source(r"\\server\share", &w).is_err());
     }
 
+    /// A stand-in for [`real`]: each path is itself, with an id of its own,
+    /// unless `links` sends it elsewhere.
+    fn fake<'a>(links: &'a [(&'a str, &'a str)], ids: &'a [(&'a str, u64)]) -> impl Fn(&str) -> Option<Real> + 'a {
+        move |p: &str| {
+            let path = links.iter().find(|(from, _)| *from == p).map_or(p, |(_, to)| *to);
+            if path == "-" {
+                return None;
+            }
+            let id = ids.iter().find(|(q, _)| *q == path).map_or(path.len() as u64 * 7919 + path.bytes().map(u64::from).sum::<u64>(), |(_, i)| *i);
+            Some(Real { path: path.to_owned(), id: (1, id) })
+        }
+    }
+
     #[test]
     fn engine_socket_aliases() {
         let none = |_: &str| None;
-        let itself = |p: &str| Some(p.to_owned());
+        let itself = fake(&[], &[]);
         #[cfg(target_os = "macos")]
         {
             let own = "/Users/me/.kiri/run/docker.sock";
             for s in ["/var/run/docker.sock", "/private/var/run/docker.sock", "/run/docker.sock", own, "/Users/me/.kiri/run//docker.sock"] {
-                assert_eq!(engine_socket_for(s, own, itself).as_deref(), Some(VM_ENGINE_SOCK), "{s}");
+                assert_eq!(engine_socket_for(s, own, &itself).as_deref(), Some(VM_ENGINE_SOCK), "{s}");
             }
             assert_eq!(engine_socket_for("/Users/me/.orbstack/run/docker.sock", own, none), None);
+            // A socket path given with a doubled slash is the same socket.
+            assert_eq!(engine_socket_for(own, "/Users/me/.kiri/run//docker.sock", none).as_deref(), Some(VM_ENGINE_SOCK));
+            // A link to Kiri's socket, and /var as the Mac spells it.
+            let to_real = [("/tmp/s.sock", "/private/tmp/real.sock"), (own, "/private/tmp/real.sock")];
+            let linked = fake(&to_real, &[]);
+            assert_eq!(engine_socket_for("/tmp/s.sock", own, &linked).as_deref(), Some(VM_ENGINE_SOCK));
+            let var = fake(&[("/var/x/docker.sock", "/private/var/run/docker.sock")], &[]);
+            assert_eq!(engine_socket_for("/var/x/docker.sock", own, &var).as_deref(), Some(VM_ENGINE_SOCK));
         }
         #[cfg(not(target_os = "macos"))]
         {
             let own = "/run/kiri/docker.sock";
             let given = Some("/run/kiri/docker.container.sock");
+            let missing = fake(&[("/var/run/docker.sock", "-"), ("/run/docker.sock", "-")], &[]);
             // Kiri's socket, by its own path, a missing Docker path, or a link
             // to it: containers are given their own socket, never the daemon's.
-            assert_eq!(engine_socket_for("/var/run/docker.sock", own, none).as_deref(), given);
-            assert_eq!(engine_socket_for("/run/docker.sock", own, none).as_deref(), given);
-            assert_eq!(engine_socket_for(own, own, itself).as_deref(), given);
-            assert_eq!(engine_socket_for("/run/kiri//docker.sock", own, itself).as_deref(), given);
-            let link = |p: &str| Some(if p == "/var/run/docker.sock" { own.to_owned() } else { p.to_owned() });
-            assert_eq!(engine_socket_for("/var/run/docker.sock", own, link).as_deref(), given);
+            assert_eq!(engine_socket_for("/var/run/docker.sock", own, &missing).as_deref(), given);
+            assert_eq!(engine_socket_for("/run/docker.sock", own, &missing).as_deref(), given);
+            assert_eq!(engine_socket_for(own, own, &itself).as_deref(), given);
+            let doubled = [("/run/kiri//docker.sock", own)];
+            assert_eq!(engine_socket_for("/run/kiri//docker.sock", own, fake(&doubled, &[])).as_deref(), given);
+            let to_own = [("/var/run/docker.sock", own)];
+            let link = fake(&to_own, &[]);
+            assert_eq!(engine_socket_for("/var/run/docker.sock", own, &link).as_deref(), given);
             // Docker's own socket: mounted as it is.
-            assert_eq!(engine_socket_for("/var/run/docker.sock", own, itself), None);
+            assert_eq!(engine_socket_for("/var/run/docker.sock", own, &itself), None);
+            // A hard link to Kiri's socket: another path, the same file.
+            let ids = [("/tmp/hard.sock", 42), (own, 42)];
+            let hard = fake(&[], &ids);
+            assert_eq!(engine_socket_for("/tmp/hard.sock", own, &hard).as_deref(), given);
+            // The path as given is what is followed, before any tidying:
+            // here only that spelling leads to Kiri's socket.
+            let spelled = [("/tmp/l//../kiri/docker.sock", own)];
+            let raw = fake(&spelled, &[]);
+            let raw = |p: &str| if p == "/tmp/l//../kiri/docker.sock" || p == own { raw(p) } else { None };
+            assert_eq!(engine_socket_for("/tmp/l//../kiri/docker.sock", own, raw).as_deref(), given);
         }
         assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", none), None);
-        assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", itself), None);
+        assert_eq!(engine_socket_for("/srv/app.sock", "/x/docker.sock", &itself), None);
     }
 }
