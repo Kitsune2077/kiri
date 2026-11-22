@@ -1208,12 +1208,6 @@ impl Client {
             .collect();
         // The sizes are the registry's word: a total that overflows is no image.
         let total = layers.iter().try_fold(0u64, |sum, l| sum.checked_add(l.size)).ok_or_else(|| Error::Manifest("the layers' sizes add up to more than any image".into()))?;
-        let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
-        progress(Progress::Resolved { layers: layers.len(), bytes: total, cached });
-        for l in &layers {
-            progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached: store.has_blob(&l.digest, l.size) });
-        }
-
         // Download missing layers in parallel, with a fixed number of workers
         // pulling from a shared queue, the largest first: the pull takes as
         // long as its slowest stream, so the big layer must not start last.
@@ -1240,6 +1234,13 @@ impl Client {
             if cfg.os.as_deref() != Some(platform.os.as_str()) || cfg.architecture.as_deref() != Some(platform.architecture.as_str()) {
                 return Err(Error::NoPlatform { wanted: platform.to_string(), available: vec![format!("{}/{}", cfg.os.as_deref().unwrap_or_default(), cfg.architecture.as_deref().unwrap_or_default())] });
             }
+        }
+        // The layers are announced once the pull will fetch them: a mirror
+        // passed over above shows none.
+        let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
+        progress(Progress::Resolved { layers: layers.len(), bytes: total, cached });
+        for l in &layers {
+            progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached: store.has_blob(&l.digest, l.size) });
         }
         std::thread::scope(|s| {
             // From the registry itself the config comes alongside the layers
@@ -3561,6 +3562,11 @@ mod tests {
             // the image names it as where it came from.
             assert_eq!(image.mirror.as_deref(), Some(origin.as_str()), "{tag}: the image is the next one's: {said:?}");
             assert!(said.iter().any(|p| matches!(p, Progress::MirrorFallback { .. })), "{tag}");
+            if tag == "arch" {
+                // Passed over before any layer: none of its layers is shown.
+                let fallback = said.iter().position(|p| matches!(p, Progress::MirrorFallback { .. })).unwrap();
+                assert!(!said[..fallback].iter().any(|p| matches!(p, Progress::Resolved { .. } | Progress::Layer { .. })), "{said:?}");
+            }
             quit(&mirror);
             quit(&origin);
             assert!(mirror_seen.join().unwrap().iter().any(|p| p.contains("/manifests/")), "{tag}");
