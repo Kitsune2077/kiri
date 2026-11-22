@@ -289,7 +289,7 @@ impl Gate {
 
     /// Writes each socket's access list.
     fn set_all(&self, uids: &[u32]) -> io::Result<()> {
-        self.sockets.iter().try_for_each(|s| set(s, uids))
+        set_each(&self.sockets, uids, set)
     }
 
     /// Checks a new connection. `None`: refused, and the reason logged.
@@ -391,6 +391,18 @@ pub fn set(socket: &Path, uids: &[u32]) -> io::Result<()> {
     if r == 0 { Ok(()) } else { Err(io::Error::last_os_error()) }
 }
 
+/// Writes the access list of every one of `sockets` with `set`, each tried
+/// whatever became of the one before; the first error, if any.
+fn set_each(sockets: &[PathBuf], uids: &[u32], set: impl Fn(&Path, &[u32]) -> io::Result<()>) -> io::Result<()> {
+    let mut first = Ok(());
+    for s in sockets {
+        if let Err(e) = set(s, uids) {
+            first = first.and(Err(e));
+        }
+    }
+    first
+}
+
 /// Whether a failure to write the list means this system can't keep one
 /// (a filesystem without ACLs): then only signing in again lets a new member in.
 pub fn unsupported(e: &io::Error) -> bool {
@@ -430,6 +442,20 @@ fn acl(uids: &[u32]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// One socket's list that cannot be written does not keep the next
+    /// from being written; the error is still reported.
+    #[test]
+    fn every_sockets_list_is_written_when_one_fails() {
+        let sockets = [PathBuf::from("/run/a.sock"), PathBuf::from("/run/b.sock")];
+        let written = Mutex::new(Vec::new());
+        let r = set_each(&sockets, &[1000], |s, _| {
+            written.lock().unwrap().push(s.to_path_buf());
+            if s.ends_with("a.sock") { Err(io::Error::other("no")) } else { Ok(()) }
+        });
+        assert!(r.is_err());
+        assert_eq!(*written.lock().unwrap(), sockets);
+    }
 
     #[test]
     fn acl_lists_each_user_once_in_order_and_not_root() {
