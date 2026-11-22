@@ -297,18 +297,28 @@ fn info_of(c: &RegistryConfig) -> Value {
 /// a key left out keeps what the file has), each entry checked and written
 /// as it will be read, duplicates dropped. Every other key in the file is
 /// kept. A file that isn't a JSON object is not overwritten: the person
-/// has to fix it, so nothing of theirs is lost. Returns the new report.
-pub fn set(body: &Value) -> Result<Value, String> {
+/// has to fix it, so nothing of theirs is lost. Returns the new report,
+/// and whether the settings in use changed, as this save found them.
+pub fn set(body: &Value) -> Result<(Value, bool), String> {
+    let path = path().ok_or_else(|| "HOME is not set".to_owned())?;
+    set_with(body, &path, current, || *READ.lock().unwrap_or_else(|e| e.into_inner()) = None, report)
+}
+
+/// [`set`], with where the file is, what is in use, how to forget what was
+/// read and the report given.
+fn set_with(body: &Value, path: &std::path::Path, current: impl Fn() -> Arc<RegistryConfig>, forget: impl Fn(), report: impl Fn() -> Value) -> Result<(Value, bool), String> {
     // One save at a time: each reads the file, changes a list and replaces
-    // the file, and two at once would lose one change (and share a temp file).
+    // the file, and two at once would lose one change (and share a temp
+    // file), or each see the other's change as already there.
     static SAVING: Mutex<()> = Mutex::new(());
     let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
-    let path = path().ok_or_else(|| "HOME is not set".to_owned())?;
-    save_at(&path, body)?;
+    let before = current();
+    save_at(path, body)?;
     // What was read before the rename is not what is there now, even when
     // the time and size agree.
-    *READ.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(report())
+    forget();
+    let changed = *current() != *before;
+    Ok((report(), changed))
 }
 
 /// [`set`]'s work on the file at `path`.
@@ -547,6 +557,38 @@ mod tests {
         assert!(problems.is_empty(), "{problems:?}");
         assert_eq!(listed, c.mirrors);
         assert!(c.is_insecure("other.lan:5000"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Two saves of the same change at once: the one that made it says so,
+    /// and the other, which waited for it, finds nothing changed (it would
+    /// otherwise restart the builder a second time).
+    #[test]
+    fn a_save_says_whether_it_changed_anything_as_it_found_the_file() {
+        let d = scratch("changed");
+        let f = Arc::new(d.join("daemon.json"));
+        let current = {
+            let f = f.clone();
+            move || Arc::new(parse(&std::fs::read(&*f).unwrap_or_default()).0)
+        };
+        let body = json!({INSECURE: ["changed.lan:5000"]});
+        let second: Arc<Mutex<Option<std::thread::JoinHandle<bool>>>> = Arc::default();
+        let (_, first) = set_with(
+            &body,
+            &f,
+            &current,
+            || {
+                // The first save has written; the second starts now.
+                let (body, f, current) = (body.clone(), f.clone(), current.clone());
+                *second.lock().unwrap() = Some(std::thread::spawn(move || set_with(&body, &f, current, || {}, || Value::Null).unwrap().1));
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            },
+            || Value::Null,
+        )
+        .unwrap();
+        let second = second.lock().unwrap().take().unwrap().join().unwrap();
+        assert!(first, "the first save changed the list");
+        assert!(!second, "the second found it already changed");
         let _ = std::fs::remove_dir_all(&d);
     }
 

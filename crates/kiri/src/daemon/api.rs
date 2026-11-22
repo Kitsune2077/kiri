@@ -983,11 +983,10 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
 
 fn set_registries(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
-    let before = super::daemon_json::current();
-    let report = super::daemon_json::set(&body).map_err(Error::BadRequest)?;
+    let (report, changed) = super::daemon_json::set(&body).map_err(Error::BadRequest)?;
     // BuildKit reads its registries from buildkitd.toml at each start; an
     // unchanged save leaves a running builder alone.
-    if *super::daemon_json::current() != *before {
+    if changed {
         super::builder::refresh(engine);
     }
     Ok(report)
