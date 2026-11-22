@@ -836,7 +836,7 @@ impl Client {
     fn unverified_ok(&self, host: &str, owner: &str) -> bool {
         self.config.is_unverified(owner)
             && !crate::config::is_hub(host)
-            && (host.eq_ignore_ascii_case(owner)
+            && (crate::config::canonical(host).is_some_and(|h| Some(h) == crate::config::canonical(owner))
                 || self.config.is_listed_host(host)
                 || (crate::reference::is_local(owner) && crate::reference::is_local(host)))
     }
@@ -2819,6 +2819,16 @@ mod tests {
         assert!(!c.unverified_ok("evil.localhost:5000", "localhost:5000"));
         assert!(!c.unverified_ok("localhost:5000", "evil.localhost:5000"));
         assert!(!c.unverified_ok("evil.localhost:5000", "evil.localhost:5000"));
+    }
+
+    /// A registry covered by a network may send its own requests back to
+    /// itself however it spells its address: `[fd00:0::1]` is `[fd00::1]`.
+    #[test]
+    fn a_registry_is_its_own_host_in_any_spelling() {
+        let c = test_client().with_config(RegistryConfig { insecure: vec![crate::config::Insecure::parse("fd00::/8").unwrap()], mirrors: Vec::new() });
+        assert!(c.unverified_ok("[fd00::1]:5000", "[fd00:0::1]:5000"));
+        assert!(c.unverified_ok("[FD00::1]:5000", "[fd00::1]:5000"));
+        assert!(!c.unverified_ok("[fd00::2]:5000", "[fd00::1]:5000"), "another address in the network is not the registry");
     }
 
     #[test]
