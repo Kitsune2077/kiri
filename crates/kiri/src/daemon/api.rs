@@ -1430,10 +1430,16 @@ fn guest_bind_source(src: &str) -> String {
 /// The guest mount lines with each Mac bind source followed again from the
 /// path the person gave (kept in `info`, one entry per line). Links are
 /// resolved when the container is made; this redoes it at start, so a link
-/// re-pointed since then leads to its new target. Lines that aren't a bind
-/// of the Mac's files stay as they are.
+/// re-pointed since then leads to its new target. On a Linux host (and
+/// WSL) only a bind of the engine's socket is looked at again, so a
+/// container made before Kiri gave containers a socket of their own gets
+/// it now. Other lines stay as they are.
 pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    if !cfg!(target_os = "macos") || guest.len() != info.len() {
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket)
+}
+
+fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>) -> Vec<String> {
+    if guest.len() != info.len() {
         return guest.to_vec();
     }
     guest
@@ -1441,7 +1447,10 @@ pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String
         .zip(info)
         .map(|(line, i)| {
             let (Some(src), Some((old, rest))) = (i["Source"].as_str().filter(|_| i["Type"] == "bind"), line.split_once('\t')) else { return line.clone() };
-            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || super::binds::engine_socket(src).is_some() {
+            if !cfg!(target_os = "macos") {
+                return engine_socket(src).map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+            }
+            if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || engine_socket(src).is_some() {
                 return line.clone();
             }
             format!("{}\t{rest}", guest_bind_source(src))
@@ -4434,6 +4443,18 @@ mod tests {
         assert_eq!(mac_source(dir.join("link").to_str().unwrap()).as_deref(), real.to_str());
         assert_eq!(mac_source("/tmp/kiri-no-such-path").as_deref(), Some("/tmp/kiri-no-such-path"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// On a Linux host a bind of the engine's socket made before Kiri gave
+    /// containers a socket of their own gets it at the next start; other
+    /// binds are mounted as they were made.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn a_socket_bind_made_earlier_is_given_the_container_socket_at_start() {
+        let guest = vec!["/run/kiri/docker.sock\t/var/run/docker.sock\t".to_owned(), "/srv/app\t/x\tro".to_owned(), "tmpfs\t/t\ttmpfs".to_owned()];
+        let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
+        let sock = |s: &str| (s == "/var/run/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock), ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"]);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
