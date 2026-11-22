@@ -266,19 +266,20 @@ fn is_stale(written: Option<&Registries>, current: &Registries) -> bool {
 
 /// The garbage collector's limits and the registries, for buildkitd's next
 /// start. [`WRITTEN`] says so only once the file is in place.
-fn write_config(engine: &Engine, id: &str) {
+fn write_config(engine: &Engine, id: &str) -> bool {
     let names = super::mirror::registry_names(engine);
     let current = Registries::now(&names);
     let toml = config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names));
     let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(toml.as_bytes()))]);
     let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
     *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then(|| std::sync::Arc::new(current));
-    if let Err(e) = written {
+    if let Err(e) = &written {
         crate::diag::warn!("builder config not written", error = format!("{e:?}"));
     }
     if kiri_vmm::rosetta_installed() {
         hide_amd64_qemu(engine, id);
     }
+    written.is_ok()
 }
 
 /// Applies a changed setting that buildkitd reads from its config (the
@@ -297,30 +298,54 @@ pub fn refresh(engine: &Engine) {
     let Some((id, status)) = find(engine) else { return };
     match refresh_action(status == Status::Running, builder_busy(engine, &id)) {
         Refresh::Leave => {}
-        Refresh::WriteOnly => write_config(engine, &id),
-        Refresh::WriteAndStop => stop_then_write(engine, &id),
+        Refresh::WriteOnly => {
+            write_config(engine, &id);
+        }
+        Refresh::WriteAndStop => {
+            stop_then_write(engine, &id);
+        }
     }
 }
 
 /// Stops a running builder (resumed first, if Kiri paused it), and only
 /// then writes today's config, into a container nothing runs in: a builder
 /// that would not stop keeps running with what [`WRITTEN`] says it has.
-fn stop_then_write(engine: &Engine, id: &str) {
+/// Returns `true` only once the builder has stopped and its config is written.
+fn stop_then_write(engine: &Engine, id: &str) -> bool {
+    stop_then_write_with(
+        engine.is_paused(id),
+        || engine.pause(id, false),
+        || engine.stop(id, Duration::from_secs(10)).map(|_| ()),
+        || write_config(engine, id),
+    )
+}
+
+fn stop_then_write_with(
+    paused: bool,
+    resume: impl FnOnce() -> Result<(), Error>,
+    stop: impl FnOnce() -> Result<(), Error>,
+    write: impl FnOnce() -> bool,
+) -> bool {
+    let (mut resume, mut stop, mut write) = (Some(resume), Some(stop), Some(write));
     for step in STOP_THEN_WRITE {
-        let done = match step {
-            Step::Resume if engine.is_paused(id) => engine.pause(id, false),
-            Step::Resume => Ok(()),
-            Step::Stop => engine.stop(id, Duration::from_secs(10)).map(|_| ()),
-            Step::Write => {
-                write_config(engine, id);
-                Ok(())
+        match step {
+            Step::Resume if paused => {
+                if let Err(e) = resume.take().unwrap()() {
+                    crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+                    return false;
+                }
             }
-        };
-        if let Err(e) = done {
-            crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
-            return;
+            Step::Resume => {}
+            Step::Stop => {
+                if let Err(e) = stop.take().unwrap()() {
+                    crate::diag::warn!("builder not stopped after a settings change", error = format!("{e:?}"));
+                    return false;
+                }
+            }
+            Step::Write => return write.take().unwrap()(),
         }
     }
+    true
 }
 
 /// The steps of [`stop_then_write`], in order.
@@ -361,6 +386,18 @@ fn refresh_if_stale(engine: &Engine) {
     }
 }
 
+struct BuilderState {
+    id: String,
+    up: bool,
+    busy: bool,
+    stale: bool,
+}
+
+fn builder_state(engine: &Engine) -> Option<BuilderState> {
+    let (id, status) = find(engine)?;
+    Some(BuilderState { up: status == Status::Running, busy: builder_busy(engine, &id), stale: stale_now(engine), id })
+}
+
 /// `POST /containers/<builder>/exec` from buildx (its docker-container
 /// driver talks to buildkitd through an exec): a builder whose config is not
 /// today's, with nothing else using it, is restarted with today's first, so
@@ -371,12 +408,37 @@ pub fn before_exec(engine: &Engine, key: &str) {
     if !restart_now(status == Status::Running, builder_busy(engine, &id), stale_now(engine)) {
         return;
     }
-    let _g = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
-    stop_then_write(engine, &id);
-    let restarted = engine.start(&id).map_err(|e| format!("{e:?}")).and_then(|()| wait_ready(engine, &id).map_err(|e| format!("{e:?}")));
-    if let Err(e) = restarted {
-        crate::diag::warn!("builder not restarted with today's registries", error = e);
+    before_exec_with(
+        &ENSURE,
+        || builder_state(engine),
+        |id| stop_then_write(engine, id),
+        |id| {
+            let restarted = engine.start(id).map_err(|e| format!("{e:?}")).and_then(|()| wait_ready(engine, id).map_err(|e| format!("{e:?}")));
+            match restarted {
+                Ok(()) => LAST_USE.store(now_secs(), Ordering::Relaxed),
+                Err(e) => crate::diag::warn!("builder not restarted with today's registries", error = e),
+            }
+        },
+    );
+}
+
+fn before_exec_with(
+    lock: &Mutex<()>,
+    recheck: impl FnOnce() -> Option<BuilderState>,
+    stop_write: impl FnOnce(&str) -> bool,
+    start: impl FnOnce(&str),
+) {
+    let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Re-checked under ENSURE: another exec, a build or the idle watch may
+    // have refreshed, stopped, removed or started using the builder meanwhile.
+    let Some(state) = recheck() else { return };
+    if !restart_now(state.up, state.busy, state.stale) {
+        return;
     }
+    if !stop_write(&state.id) {
+        return;
+    }
+    start(&state.id);
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -1288,6 +1350,130 @@ mod tests {
         assert!(!restart_now(true, false, false));
         let at = |s: Step| STOP_THEN_WRITE.iter().position(|x| *x == s).unwrap();
         assert!(at(Step::Resume) < at(Step::Stop) && at(Step::Stop) < at(Step::Write), "{STOP_THEN_WRITE:?}");
+    }
+
+    /// `before_exec` re-checks the builder's state under `ENSURE` (so a waiter
+    /// never kills a builder that became busy, fresh, stopped or gone while
+    /// waiting), and never starts the builder if resuming, stopping or writing
+    /// its config failed.
+    #[test]
+    fn before_exec_rechecks_under_lock_and_skips_start_when_stop_fails() {
+        // 1. State changed while waiting on the lock: nothing stopped or started.
+        let cases: Vec<(&str, Option<BuilderState>)> = vec![
+            ("now busy", Some(BuilderState { id: "b1".into(), up: true, busy: true, stale: true })),
+            ("already fresh", Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: false })),
+            ("already stopped", Some(BuilderState { id: "b1".into(), up: false, busy: false, stale: true })),
+            ("gone", None),
+        ];
+        for (label, under_lock) in cases {
+            let lock = Arc::new(Mutex::new(()));
+            let held = lock.lock().unwrap();
+            let shared: Arc<Mutex<Option<BuilderState>>> = Arc::new(Mutex::new(Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true })));
+            let actions: Arc<Mutex<Vec<String>>> = Arc::default();
+            let waiter = std::thread::spawn({
+                let (lock, shared, actions) = (lock.clone(), shared.clone(), actions.clone());
+                move || {
+                    before_exec_with(
+                        &lock,
+                        || shared.lock().unwrap().take(),
+                        |id| {
+                            actions.lock().unwrap().push(format!("stop:{id}"));
+                            true
+                        },
+                        |id| actions.lock().unwrap().push(format!("start:{id}")),
+                    );
+                }
+            });
+            // Mutate state while holding the lock, then release it.
+            *shared.lock().unwrap() = under_lock;
+            drop(held);
+            waiter.join().unwrap();
+            assert!(actions.lock().unwrap().is_empty(), "{label}: {:?}", actions.lock().unwrap());
+        }
+
+        // 2. Resume, stop or config write fails: start is never called.
+        let err = || Err(Error::Conflict("boom".into()));
+        let steps = std::cell::RefCell::new(Vec::new());
+        assert!(!stop_then_write_with(
+            true,
+            || {
+                steps.borrow_mut().push("resume");
+                err()
+            },
+            || {
+                steps.borrow_mut().push("stop");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("write");
+                true
+            },
+        ));
+        assert_eq!(*steps.borrow(), ["resume"]);
+
+        steps.borrow_mut().clear();
+        assert!(!stop_then_write_with(
+            false,
+            || {
+                steps.borrow_mut().push("resume");
+                Ok(())
+            },
+            || {
+                steps.borrow_mut().push("stop");
+                err()
+            },
+            || {
+                steps.borrow_mut().push("write");
+                true
+            },
+        ));
+        assert_eq!(*steps.borrow(), ["stop"]);
+
+        let lock = Mutex::new(());
+        let mut started = false;
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true }),
+            |_| stop_then_write_with(false, || Ok(()), err, || true),
+            |_| started = true,
+        );
+        assert!(!started, "must not start when stop failed");
+
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b1".into(), up: true, busy: false, stale: true }),
+            |_| stop_then_write_with(false, || Ok(()), || Ok(()), || false),
+            |_| started = true,
+        );
+        assert!(!started, "must not start when config write failed");
+
+        // 3. Still running, idle and stale under the lock, and stop+write
+        // succeed: restarts the re-fetched container id.
+        let log = std::cell::RefCell::new(Vec::new());
+        before_exec_with(
+            &lock,
+            || Some(BuilderState { id: "b2".into(), up: true, busy: false, stale: true }),
+            |id| {
+                log.borrow_mut().push(format!("stop:{id}"));
+                stop_then_write_with(
+                    true,
+                    || {
+                        log.borrow_mut().push("resume".into());
+                        Ok(())
+                    },
+                    || {
+                        log.borrow_mut().push("stop".into());
+                        Ok(())
+                    },
+                    || {
+                        log.borrow_mut().push("write".into());
+                        true
+                    },
+                )
+            },
+            |id| log.borrow_mut().push(format!("start:{id}")),
+        );
+        assert_eq!(*log.borrow(), ["stop:b2", "resume", "stop", "write", "start:b2"]);
     }
 
     #[test]
