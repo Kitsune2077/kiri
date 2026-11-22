@@ -1141,26 +1141,38 @@ impl Client {
         queue.sort_by_key(|l| l.size);
         let queue = Mutex::new(queue);
         let first_error: Mutex<Option<Error>> = Mutex::new(None);
+        // Bounded: the manifest declares the size, and a config is small.
+        let fetch_config = || -> Result<(), Error> {
+            let _on = cancel.enter();
+            if store.has_blob(&config.digest, config.size) {
+                return Ok(());
+            }
+            self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, Some(config.size), &|_| {}, cancel).map(|_| ())
+        };
+        // A mirror stands in for Docker Hub: an image for another platform
+        // than the one asked is not Hub's answer, and the pull moves on
+        // before any layer is fetched. (From the registry itself it is
+        // kept, as Docker keeps it.)
+        let mirror = (target.registry != name.registry).then(|| target.registry.clone());
+        if mirror.is_some() {
+            fetch_config().map_err(|e| if cancel.is_cancelled() { Error::Cancelled } else { e })?;
+            let cfg: ImageConfig = serde_json::from_slice(&store.read_config(&config.digest)?).map_err(|e| Error::Manifest(e.to_string()))?;
+            if cfg.os.as_deref() != Some(platform.os.as_str()) || cfg.architecture.as_deref() != Some(platform.architecture.as_str()) {
+                return Err(Error::NoPlatform { wanted: platform.to_string(), available: vec![format!("{}/{}", cfg.os.as_deref().unwrap_or_default(), cfg.architecture.as_deref().unwrap_or_default())] });
+            }
+        }
         std::thread::scope(|s| {
-            // The config, alongside the layers rather than before them: it is
-            // small, and fetching it first cost a round trip to the registry
-            // and one to its CDN before any layer started.
-            s.spawn(|| {
-                let _on = cancel.enter();
-                if store.has_blob(&config.digest, config.size) {
-                    return;
-                }
-                // Bounded: the manifest declares the size, and a config is small.
-                let result = self.download_with(store, target, &config.digest, crate::store::MAX_CONFIG, &|_| {}, cancel).and_then(|got| {
-                    if got != config.size {
-                        return Err(Error::Manifest(format!("config {} is {got} bytes, the manifest says {}", config.digest, config.size)));
+            // From the registry itself the config comes alongside the layers
+            // rather than before them: it is small, and fetching it first
+            // cost a round trip to the registry and one to its CDN before
+            // any layer started.
+            if mirror.is_none() {
+                s.spawn(|| {
+                    if let Err(e) = fetch_config() {
+                        first_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
                     }
-                    Ok(())
                 });
-                if let Err(e) = result {
-                    first_error.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert(e);
-                }
-            });
+            }
             for _ in 0..PARALLEL_LAYERS.min(layers.len()) {
                 s.spawn(|| {
                     let _on = cancel.enter();
@@ -1177,12 +1189,7 @@ impl Client {
                             // what tells a longer body from the end), and
                             // exactly that.
                             let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), &on_bytes, cancel).and_then(|got| {
-                                if got != layer.size {
-                                    return Err(Error::Manifest(format!("layer {} is {got} bytes, the manifest says {}", layer.digest, layer.size)));
-                                }
-                                Ok(got)
-                            })
+                            self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), Some(layer.size), &on_bytes, cancel)
                         };
                         match result {
                             Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
@@ -1204,13 +1211,6 @@ impl Client {
         }
         let cfg_bytes = store.read_config(&config.digest)?;
         let cfg: ImageConfig = serde_json::from_slice(&cfg_bytes).map_err(|e| Error::Manifest(e.to_string()))?;
-        // A mirror stands in for Docker Hub: an image for another platform
-        // than the one asked is not Hub's answer, and the pull moves on.
-        // (From the registry itself it is kept, as Docker keeps it.)
-        let mirror = (target.registry != name.registry).then(|| target.registry.clone());
-        if mirror.is_some() && (cfg.os.as_deref() != Some(platform.os.as_str()) || cfg.architecture.as_deref() != Some(platform.architecture.as_str())) {
-            return Err(Error::NoPlatform { wanted: platform.to_string(), available: vec![format!("{}/{}", cfg.os.as_deref().unwrap_or_default(), cfg.architecture.as_deref().unwrap_or_default())] });
-        }
 
         let run = cfg.config.unwrap_or_default();
         let image = Image {
@@ -1264,7 +1264,7 @@ impl Client {
     /// Streams one blob into the store, verifying its digest. Returns its size.
     #[cfg(test)]
     fn download(&self, store: &Store, r: &Reference, digest: &str, on_bytes: &dyn Fn(u64)) -> Result<u64, Error> {
-        self.download_with(store, r, digest, u64::MAX, on_bytes, &Cancel::new())
+        self.download_with(store, r, digest, u64::MAX, None, on_bytes, &Cancel::new())
     }
 
     /// Downloads a blob, telling `on_bytes` how much has arrived every
@@ -1272,9 +1272,11 @@ impl Client {
     /// or stalls ([`crate::connect::STALL`]) is resumed from where it got to
     /// (a `Range` request; from the start if the server ignores it), as
     /// Docker retries a layer, up to [`BLOB_TRIES`] times in a row without
-    /// progress. Refuses bodies over `max` bytes, and stops (removing what
-    /// it wrote) once `cancel` is.
-    fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
+    /// progress. Refuses bodies over `max` bytes, and one that is not
+    /// exactly `want` bytes when given (before it goes into the store), and
+    /// stops (removing what it wrote) once `cancel` is.
+    #[allow(clippy::too_many_arguments)]
+    fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, want: Option<u64>, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
         let url = format!("{}/v2/{}/blobs/{digest}", self.base(r.api_host()), r.repository);
         let mut out = store.blob_writer(digest)?;
         let mut buf = vec![0u8; 256 * 1024];
@@ -1311,6 +1313,9 @@ impl Client {
                 }
             })();
             match result {
+                Ok(()) if want.is_some_and(|w| w != got) => {
+                    return Err(Error::Manifest(format!("{digest} is {got} bytes, the manifest says {}", want.unwrap_or_default())));
+                }
                 Ok(()) => return Ok(out.finish()?),
                 Err(_) if cancel.is_cancelled() => return Err(Error::Cancelled),
                 Err(e) if transient(&e) => {
@@ -2505,7 +2510,7 @@ mod tests {
         let started = Instant::now();
         let result = {
             let _on = cancel.enter();
-            client.download_with(&store, &r, &digest, u64::MAX, &|_| {}, &cancel)
+            client.download_with(&store, &r, &digest, u64::MAX, None, &|_| {}, &cancel)
         };
         assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
@@ -3266,6 +3271,40 @@ mod tests {
         assert_eq!(std::fs::read_dir(root.join("tmp")).map(|d| d.count()).unwrap_or(0), 0, "nothing is left of it");
         quit(&origin);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A layer longer than its manifest says, whose digest is the longer
+    /// body's, is refused before it goes into the store, whatever limit the
+    /// read had (here none, and no length header).
+    #[test]
+    fn a_layer_of_the_wrong_length_never_reaches_the_store() {
+        let body = "kiri registry test layer, one byte longer than declared";
+        let (host, _) = recording_server(move |_| format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n0\r\n\r\n", body.len()));
+        let root = std::env::temp_dir().join(format!("kiri-wrong-length-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let r = Reference::parse(&format!("{host}/team/app:1")).unwrap();
+        let digest = sha256_digest(body.as_bytes());
+        let declared = body.len() as u64 - 1;
+        let got = test_client().download_with(&store, &r, &digest, u64::MAX, Some(declared), &|_| {}, &Cancel::new());
+        assert!(got.is_err(), "{got:?}");
+        assert!(!store.blob_path(&digest).unwrap().exists(), "the blob was not stored");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A mirror's image for another platform is turned down from its config,
+    /// before any of its layers is fetched.
+    #[test]
+    fn a_mirror_for_another_platform_is_left_before_its_layers() {
+        let (mirror, mirror_seen) = image_server_with(200, "arm64", Some(b"kiri registry mirror test layer".to_vec()));
+        let (origin, _) = image_server(200);
+        let (image, _) = pull_through(&mirror, &origin, "platform-first");
+        assert!(image.is_ok());
+        quit(&mirror);
+        quit(&origin);
+        let layer = sha256_digest(b"kiri registry mirror test layer");
+        let asked = mirror_seen.join().unwrap();
+        assert!(!asked.iter().any(|p| p.contains(&layer)), "{asked:?}");
     }
 
     /// Signed in to Docker Hub, a pull asks the mirrors only for official
