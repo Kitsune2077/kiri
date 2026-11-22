@@ -267,8 +267,10 @@ pub fn config(engine: &Engine, c: &kiri_image::RegistryConfig, names: &[String])
 ///
 /// BuildKit (util/resolver) reads `http` and `insecure` together: both set
 /// is HTTPS without a certificate check, falling back to plain HTTP when
-/// the answer is not TLS, which is what a pull does for a host it probes
-/// (a listed host, a registry the store names inside a listed network);
+/// the answer is not TLS (unlike a pull, a portless plain-HTTP registry on
+/// port 80 does not fall back when port 443 is closed), which is what a
+/// pull does for a host it probes (a listed host, a registry the store
+/// names inside a listed network);
 /// `http` alone is plain HTTP only; `insecure` alone (with `http = false`,
 /// so `localhost` is not sent plain HTTP by default) is unchecked HTTPS
 /// only. A mirror is asked over the scheme it was written with, as a pull
