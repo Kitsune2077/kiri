@@ -308,8 +308,8 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
                     Err(e) => return reply(w, Err(e), 204),
                     _ => {}
                 }
-                super::builder::before_start(engine, id);
-                return reply(w, engine.start(id).map(|()| Value::Null), 204);
+                let started = super::builder::start(engine, id).unwrap_or_else(|| engine.start(id));
+                return reply(w, started.map(|()| Value::Null), 204);
             }
             ("POST", "stop") => {
                 let t = stop_timeout(req, engine, id);
@@ -328,8 +328,7 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
                 let r = engine.stop(id, t).and_then(|_| {
                     // Wait for the exit to be recorded before starting again.
                     engine.wait(id, "not-running")?;
-                    super::builder::before_start(engine, id);
-                    engine.start(id)
+                    super::builder::start(engine, id).unwrap_or_else(|| engine.start(id))
                 });
                 return reply(w, r.map(|()| Value::Null), 204);
             }
@@ -984,16 +983,24 @@ fn set_proxy(req: &Request) -> Result<Value, Error> {
     Ok(super::proxy::report())
 }
 
-fn set_registries(req: &Request, engine: &Arc<Engine>) -> Result<Value, Error> {
+fn set_registries(req: &Request, engine: &Engine) -> Result<Value, Error> {
+    set_registries_with(req, super::daemon_json::set, || super::builder::refresh(engine))
+}
+
+fn set_registries_with(
+    req: &Request,
+    save: impl FnOnce(&Value) -> Result<(Value, bool), String>,
+    refresh: impl FnOnce(),
+) -> Result<Value, Error> {
     let body: Value = serde_json::from_slice(&req.body).map_err(|e| Error::BadRequest(format!("invalid JSON: {e}")))?;
-    let (report, changed) = super::daemon_json::set(&body).map_err(Error::BadRequest)?;
+    let (report, changed) = save(&body).map_err(Error::BadRequest)?;
     // BuildKit reads its registries from buildkitd.toml at each start; an
-    // unchanged save leaves a running builder alone. The save answers at
-    // once: stopping the builder, or waiting for one being made, is not the
-    // window's or the CLI's to wait for.
+    // unchanged save leaves the builder alone. A stopped builder gets the
+    // new file now if nothing holds ENSURE; a running one is left to the
+    // next build or the idle watch rather than stopped from a detached
+    // thread after this save has answered.
     if changed {
-        let engine = engine.clone();
-        let _ = std::thread::Builder::new().name("kiri-builder-refresh".into()).spawn(move || super::builder::refresh(&engine));
+        refresh();
     }
     Ok(report)
 }
@@ -4221,6 +4228,30 @@ mod tests {
         assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `POST /kiri/registries` refreshes synchronously on the request thread
+    /// only when the save changed settings, never from a detached thread after
+    /// answering.
+    #[test]
+    fn set_registries_refreshes_synchronously_without_a_detached_thread() {
+        let req = Request::internal("POST", "/kiri/registries", &[], b"{}".to_vec());
+        let caller = std::thread::current().id();
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), true)), move || {
+            *ran2.lock().unwrap() = Some(std::thread::current().id());
+        })
+        .unwrap();
+        assert_eq!(*ran.lock().unwrap(), Some(caller), "refresh must finish on the caller thread before answering");
+
+        let ran = std::sync::Arc::new(std::sync::Mutex::new(false));
+        let ran2 = ran.clone();
+        set_registries_with(&req, |_| Ok((json!({}), false)), move || {
+            *ran2.lock().unwrap() = true;
+        })
+        .unwrap();
+        assert!(!*ran.lock().unwrap(), "unchanged save must not refresh");
     }
 
     /// A pull sent with a body, as docker-modem (so Testcontainers for Node)
