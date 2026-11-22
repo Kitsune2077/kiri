@@ -176,6 +176,7 @@ insecure-http-auth-pull	#329	pulling with credentials from a listed plain-HTTP r
 insecure-other-port-still-refused	#329	an insecure entry must cover its own host and port only, as Docker matches it, shown against a registry that answers on the unlisted port
 insecure-docker-info	#329	docker info listed no Insecure Registries
 insecure-build	#329	docker build FROM a plain-HTTP registry failed: buildkitd.toml had no http/insecure entry for it
+insecure-selfsigned-build	#329	docker build FROM a self-signed HTTPS registry in the list must reach it over HTTPS without a certificate check
 insecure-removed-refused	#329	a registry taken off the list must be refused again, without a restart
 insecure-hand-edit	#329	daemon.json edited by hand must apply at the next pull, without a restart
 insecure-hand-edit-keeps-keys	#329	saving from kiri registry must keep the other keys a hand-edited daemon.json has

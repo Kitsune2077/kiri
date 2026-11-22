@@ -1459,7 +1459,11 @@ if [ -n "$HOSTIP" ]; then
   t insecure-http-push "digest: sha256:" bash -c "$R tag alpine $HOSTIP:5055/team/alp:3 && $R push $HOSTIP:5055/team/alp:3 2>&1"
   t insecure-http-auth-pull "3." bash -c "$R rmi $HOSTIP:5055/team/alp:3 >/dev/null && $R pull -q $HOSTIP:5055/team/alp:3 >/dev/null && $R run --rm $HOSTIP:5055/team/alp:3 cat /etc/alpine-release"
   t insecure-docker-info "$HOSTIP:5055" bash -c "$D info 2>/dev/null | sed -n '/Insecure Registries/,/^ [A-Z]/p'"
-  t insecure-cli-remove "no insecure registries" "$KIRI" registry insecure remove "$HOSTIP:5055"
+  # Gone from the list, whatever else this computer's daemon.json lists.
+  t insecure-cli-remove "removed" bash -c "\"$KIRI\" registry insecure remove $HOSTIP:5055 >/dev/null && { \"$KIRI\" registry insecure list | grep -qxF '  $HOSTIP:5055' && echo still listed || echo removed; }"
+  # A container given the engine's socket reads the lists but cannot
+  # change them.
+  t socket-mount-settings-refused "not from a container" $D run --rm -v "$SOCK:/var/run/docker.sock" alpine sh -c "apk add -q curl >/dev/null 2>&1; curl -s --unix-socket /var/run/docker.sock -X POST -H 'Content-Type: application/json' -d '{\"insecure-registries\": [\"10.9.9.9:5000\"]}' http://d/kiri/registries"
   t insecure-removed-refused "refused" bash -c "$R rmi $HOSTIP:5055/team/alp:3 >/dev/null 2>&1; $R pull $HOSTIP:5055/team/alp:3 >/dev/null 2>&1 && echo pulled || echo refused"
   # A plain-HTTP mirror goes with its host in the insecure list.
   t mirror-cli-plain-needs-listing "plain HTTP" bash -c "\"$KIRI\" registry mirror add http://$HOSTIP:5056 2>&1"
