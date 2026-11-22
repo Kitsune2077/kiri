@@ -144,8 +144,10 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
     // Kiri's own endpoints that change something are for this machine's
     // programs (caller.rs), not for a container given the socket.
     if caller == Caller::Container && !container_may(m, p) {
+        // Closed after the answer: a body the request carried is not left
+        // on the connection to be read as the next request.
         http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
-        return Ok(Next::KeepAlive);
+        return Ok(Next::Close);
     }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
@@ -4092,41 +4094,81 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// The `(method, path)` routes a `route` function's body matches, read
+    /// from its source: single or `|`-separated methods, a literal
+    /// `/kiri…` path or a `p.strip_prefix("/kiri/…")` guard (with an
+    /// optional `strip_suffix`). Any other line naming a `/kiri` path (an
+    /// arm split over lines, a method in a variable) fails the test rather
+    /// than going unseen; a handler repeating its arm's `strip_prefix` is
+    /// fine.
+    fn kiri_routes(body: &str) -> Vec<(String, String)> {
+        let mut routes: Vec<(String, String)> = Vec::new();
+        let mut prefixes: Vec<String> = Vec::new();
+        for line in body.lines().map(str::trim).filter(|l| !l.starts_with("//")) {
+            let names_kiri = line.contains("\"/kiri");
+            let arm = line.strip_prefix('(').filter(|r| r.starts_with('"')).and_then(|r| {
+                let (methods, rest) = r.split_once(", ")?;
+                let methods: Option<Vec<&str>> = methods.split('|').map(|m| m.trim().strip_prefix('"')?.strip_suffix('"')).collect();
+                Some((methods?, rest))
+            });
+            let path = arm.as_ref().and_then(|(_, rest)| {
+                if let Some(lit) = rest.strip_prefix("\"/kiri") {
+                    Some(format!("/kiri{}", lit.split('"').next()?))
+                } else if let Some(i) = rest.find("strip_prefix(\"/kiri/") {
+                    let prefix = rest[i + "strip_prefix(\"".len()..].split('"').next()?;
+                    let suffix = rest.split("strip_suffix(\"").nth(1).map_or("", |s| s.split('"').next().unwrap_or_default());
+                    Some(format!("{prefix}1{suffix}"))
+                } else {
+                    None
+                }
+            });
+            match (arm, path) {
+                (Some((methods, _)), Some(path)) => {
+                    if let Some(i) = line.find("strip_prefix(\"/kiri/") {
+                        prefixes.push(line[i..].split('"').nth(1).unwrap_or_default().to_owned());
+                    }
+                    routes.extend(methods.iter().map(|m| ((*m).to_owned(), path.clone())));
+                }
+                _ if names_kiri => {
+                    let repeats = line.find("strip_prefix(\"/kiri/").is_some_and(|i| prefixes.iter().any(|p| line[i..].split('"').nth(1) == Some(p.as_str())));
+                    assert!(repeats, "a /kiri path the route reader cannot read: {line}");
+                }
+                _ => {}
+            }
+        }
+        routes
+    }
+
     /// Every one of Kiri's own endpoints that changes something is refused
     /// on a container's connection, unless listed in `CONTAINER_MAY`; GETs
-    /// stay open. The routes are read from `route` itself, so one added
-    /// later is covered too.
+    /// and HEADs stay open. The routes are read from `route` itself and
+    /// from `ops::route` (which it asks first), so one added later is
+    /// covered too.
     #[test]
     fn a_container_changes_nothing_through_kiris_own_endpoints() {
-        let src = include_str!("api.rs");
-        let body = &src[src.find("\nfn route(").unwrap()..];
-        let body = &body[..body.find("\n}\n").unwrap()];
-        let mut routes: Vec<(String, String)> = Vec::new();
-        for line in body.lines().map(str::trim) {
-            let Some(rest) = line.strip_prefix("(\"") else { continue };
-            let Some((method, rest)) = rest.split_once('"') else { continue };
-            // `("POST", "/kiri/stop")`, or a pattern with `p.strip_prefix("/kiri/…")`.
-            let path = if let Some(lit) = rest.strip_prefix(", \"/kiri") {
-                format!("/kiri{}", lit.split('"').next().unwrap())
-            } else if let Some(i) = rest.find("strip_prefix(\"/kiri/") {
-                let prefix = rest[i + "strip_prefix(\"".len()..].split('"').next().unwrap();
-                let suffix = rest.split("strip_suffix(\"").nth(1).map_or("", |s| s.split('"').next().unwrap());
-                format!("{prefix}1{suffix}")
-            } else {
-                continue;
-            };
-            routes.push((method.to_owned(), path));
-        }
+        let body_of = |src: &'static str, start: &str| {
+            let body = &src[src.find(start).unwrap()..];
+            &body[..body.find("\n}\n").unwrap()]
+        };
+        let mut routes = kiri_routes(body_of(include_str!("api.rs"), "\nfn route("));
+        routes.extend(kiri_routes(body_of(include_str!("ops.rs"), "\npub fn route(")));
         for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1")] {
             assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
         }
         for (m, p) in &routes {
-            let open = m == "GET" || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            let open = matches!(m.as_str(), "GET" | "HEAD") || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
             assert_eq!(container_may(m, p), open, "{m} {p}");
         }
         assert!(!container_may("PATCH", "/kiri/anything/new"));
         assert!(!container_may("POST", "/kiri"));
-        assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries"));
+        assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries") && container_may("HEAD", "/kiri/registries"));
+        // The reader itself: arms of several methods are read as each, and
+        // a /kiri path it cannot read stops the test.
+        let read = kiri_routes("        (\"POST\" | \"DELETE\", \"/kiri/x\") => {}\n        (\"GET\" | \"HEAD\", p) if p.strip_prefix(\"/kiri/y/\").is_some() => {\n            go(p.strip_prefix(\"/kiri/y/\"));\n        }");
+        assert_eq!(read, [("POST".to_owned(), "/kiri/x".to_owned()), ("DELETE".into(), "/kiri/x".into()), ("GET".into(), "/kiri/y/1".into()), ("HEAD".into(), "/kiri/y/1".into())]);
+        for unreadable in ["        (m, \"/kiri/z\") => {}", "        (\"POST\",\n            \"/kiri/z\") => {}"] {
+            assert!(std::panic::catch_unwind(|| kiri_routes(unreadable)).is_err(), "{unreadable}");
+        }
     }
 
     /// Through the API itself: a container's Stop and settings are refused,
@@ -4147,6 +4189,31 @@ mod tests {
             served.join().unwrap().unwrap();
             assert!(got.starts_with("HTTP/1.1 403 "), "{req}: {got}");
         }
+        // Refused, the connection ends after the answer even when the
+        // client asked to keep it: the body is not read as a request.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        client.write_all(b"POST /kiri/registries HTTP/1.1\r\nHost: d\r\nContent-Length: 2\r\n\r\n{}").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 403 "), "{got}");
+        // What a container may do still answers: the registry lists are
+        // readable from one.
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let served = std::thread::spawn({
+            let engine = engine.clone();
+            move || serve(server, engine, Caller::Container)
+        });
+        client.write_all(b"GET /kiri/registries HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n").unwrap();
+        let mut got = String::new();
+        client.read_to_string(&mut got).unwrap();
+        served.join().unwrap().unwrap();
+        assert!(got.starts_with("HTTP/1.1 200 "), "{got}");
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
