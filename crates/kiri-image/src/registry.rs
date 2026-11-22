@@ -1308,6 +1308,9 @@ impl Client {
     /// stops (removing what it wrote) once `cancel` is.
     #[allow(clippy::too_many_arguments)]
     fn download_with(&self, store: &Store, r: &Reference, digest: &str, max: u64, want: Option<u64>, on_bytes: &dyn Fn(u64), cancel: &Cancel) -> Result<u64, Error> {
+        // A declared size bounds the read too: one byte over it is enough
+        // to tell a longer body from the end.
+        let max = want.map_or(max, |w| w.saturating_add(1).min(max));
         let url = format!("{}/v2/{}/blobs/{digest}", self.base(r.api_host()), r.repository);
         let mut out = store.blob_writer(digest)?;
         let mut buf = vec![0u8; 256 * 1024];
@@ -3356,6 +3359,25 @@ mod tests {
         let declared = body.len() as u64 - 1;
         let got = test_client().download_with(&store, &r, &digest, u64::MAX, Some(declared), &|_| {}, &Cancel::new());
         assert!(got.is_err(), "{got:?}");
+        assert!(!store.blob_path(&digest).unwrap().exists(), "the blob was not stored");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A blob with a declared size is read no further than one byte past
+    /// it, whatever larger limit the caller gave (a config's is MAX_CONFIG).
+    #[test]
+    fn a_blob_is_read_no_further_than_its_declared_size() {
+        let body = "x".repeat(64 * 1024);
+        let sent = body.clone();
+        let (host, _) = recording_server(move |_| format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{sent}\r\n0\r\n\r\n", sent.len()));
+        let root = std::env::temp_dir().join(format!("kiri-declared-size-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let r = Reference::parse(&format!("{host}/team/app:1")).unwrap();
+        let digest = sha256_digest(body.as_bytes());
+        let got = test_client().download_with(&store, &r, &digest, crate::store::MAX_CONFIG, Some(100), &|_| {}, &Cancel::new());
+        let err = format!("{got:?}");
+        assert!(err.contains("BodyExceedsLimit(101)"), "{err}");
         assert!(!store.blob_path(&digest).unwrap().exists(), "the blob was not stored");
         let _ = std::fs::remove_dir_all(&root);
     }
