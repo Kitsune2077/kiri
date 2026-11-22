@@ -1433,23 +1433,29 @@ fn guest_bind_source(src: &str) -> String {
 /// re-pointed since then leads to its new target. On a Linux host (and
 /// WSL) only a bind of the engine's socket is looked at again, so a
 /// container made before Kiri gave containers a socket of their own gets
-/// it now. Other lines stay as they are.
+/// it now: by the path the person gave, or else by the path mounted when
+/// it was made, every line, whether or not `info` has one for it. Other
+/// lines stay as they are.
 pub(super) fn fresh_bind_sources(guest: &[String], info: &[Value]) -> Vec<String> {
-    fresh_bind_sources_with(guest, info, super::binds::engine_socket)
+    fresh_bind_sources_with(guest, info, super::binds::engine_socket, cfg!(target_os = "macos"))
 }
 
-fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>) -> Vec<String> {
-    if guest.len() != info.len() {
+fn fresh_bind_sources_with(guest: &[String], info: &[Value], engine_socket: impl Fn(&str) -> Option<String>, mac: bool) -> Vec<String> {
+    let paired = guest.len() == info.len();
+    if mac && !paired {
         return guest.to_vec();
     }
     guest
         .iter()
-        .zip(info)
-        .map(|(line, i)| {
-            let (Some(src), Some((old, rest))) = (i["Source"].as_str().filter(|_| i["Type"] == "bind"), line.split_once('\t')) else { return line.clone() };
-            if !cfg!(target_os = "macos") {
-                return engine_socket(src).map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
+        .enumerate()
+        .map(|(idx, line)| {
+            let Some((old, rest)) = line.split_once('\t') else { return line.clone() };
+            let src = info.get(idx).filter(|i| paired && i["Type"] == "bind").and_then(|i| i["Source"].as_str());
+            if !mac {
+                let given = src.and_then(&engine_socket).or_else(|| old.starts_with('/').then(|| engine_socket(old)).flatten());
+                return given.map_or_else(|| line.clone(), |given| format!("{given}\t{rest}"));
             }
+            let Some(src) = src else { return line.clone() };
             if !old.strip_prefix(MAC_ROOT).is_some_and(|p| p.starts_with('/')) || engine_socket(src).is_some() {
                 return line.clone();
             }
@@ -4448,13 +4454,24 @@ mod tests {
     /// On a Linux host a bind of the engine's socket made before Kiri gave
     /// containers a socket of their own gets it at the next start; other
     /// binds are mounted as they were made.
-    #[cfg(not(target_os = "macos"))]
     #[test]
     fn a_socket_bind_made_earlier_is_given_the_container_socket_at_start() {
         let guest = vec!["/run/kiri/docker.sock\t/var/run/docker.sock\t".to_owned(), "/srv/app\t/x\tro".to_owned(), "tmpfs\t/t\ttmpfs".to_owned()];
         let info = vec![json!({"Type": "bind", "Source": "/var/run/docker.sock"}), json!({"Type": "bind", "Source": "/srv/app"}), json!({"Type": "tmpfs", "Source": ""})];
-        let sock = |s: &str| (s == "/var/run/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
-        assert_eq!(fresh_bind_sources_with(&guest, &info, sock), ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"]);
+        let sock = |s: &str| matches!(s, "/var/run/docker.sock" | "/run/kiri/docker.sock").then(|| "/run/kiri/docker.container.sock".to_owned());
+        let given = ["/run/kiri/docker.container.sock\t/var/run/docker.sock\t", "/srv/app\t/x\tro", "tmpfs\t/t\ttmpfs"];
+        assert_eq!(fresh_bind_sources_with(&guest, &info, sock, false), given);
+        // The path the person gave no longer leads to the socket (a link
+        // removed or re-pointed): the path mounted when it was made does.
+        let moved = vec![json!({"Type": "bind", "Source": "/home/me/sock-link"}), info[1].clone(), info[2].clone()];
+        assert_eq!(fresh_bind_sources_with(&guest, &moved, sock, false), given);
+        // Records that don't pair one to one with the mount lines: each
+        // line is still looked at by the path it mounts.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, false), given);
+        assert_eq!(fresh_bind_sources_with(&guest, &[], sock, false), given);
+        // A Mac follows binds from the records only, so it leaves unpaired
+        // lines as they are.
+        assert_eq!(fresh_bind_sources_with(&guest, &info[1..], sock, true), guest);
     }
 
     /// A linked bind source is followed again at each start: re-pointing the
