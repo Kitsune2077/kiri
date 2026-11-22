@@ -684,34 +684,73 @@ fn stale(e: &ureq::Error) -> bool {
 
 /// The scheme each `insecure-registries` host answered on, and until when
 /// that is trusted: HTTPS is asked first, as Docker asks it, and a host
-/// that only speaks plain HTTP is asked that way from then on.
+/// that only speaks plain HTTP is asked that way from then on. Keyed by the
+/// host in its one spelling ([`crate::config::canonical`]), and at most
+/// [`MAX_SCHEMES`] hosts: past that the expired ones go, and if none has,
+/// all of them.
 static SCHEMES: std::sync::LazyLock<Mutex<HashMap<String, (&'static str, Instant)>>> = std::sync::LazyLock::new(Default::default);
+
+/// One lock per host being asked, so pulls that need the same host at once
+/// wait for one answer instead of each asking (and each waiting out a host
+/// that does not answer).
+static PROBING: std::sync::LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> = std::sync::LazyLock::new(Default::default);
 
 /// How long a found scheme is used before the host is asked again.
 const SCHEME_TTL: Duration = Duration::from_secs(300);
+/// How long a host that answered neither is left before it is asked again.
+const SCHEME_FAILED_TTL: Duration = Duration::from_secs(30);
+const MAX_SCHEMES: usize = 256;
+
+fn remembered_scheme(key: &str) -> Option<&'static str> {
+    SCHEMES.lock().unwrap_or_else(|e| e.into_inner()).get(key).copied().filter(|(_, until)| Instant::now() < *until).map(|(s, _)| s)
+}
+
+fn remember_scheme(key: String, scheme: &'static str, ttl: Duration) {
+    let mut schemes = SCHEMES.lock().unwrap_or_else(|e| e.into_inner());
+    if schemes.len() >= MAX_SCHEMES && !schemes.contains_key(&key) {
+        let now = Instant::now();
+        schemes.retain(|_, (_, until)| now < *until);
+        if schemes.len() >= MAX_SCHEMES {
+            schemes.clear();
+        }
+    }
+    schemes.insert(key, (scheme, Instant::now() + ttl));
+}
 
 /// The scheme an `insecure-registries` host answers on: `https` if it
 /// answers HTTPS at all (any status, the certificate unchecked), else
 /// `http` if it answers plain HTTP. Remembered for [`SCHEME_TTL`]; a host
-/// that answers neither is not remembered, and is asked over HTTPS, so the
-/// error says what that said.
+/// that answers neither is asked over HTTPS, so the error says what that
+/// said, and is remembered so for [`SCHEME_FAILED_TTL`].
 fn insecure_scheme(host: &str) -> &'static str {
-    if let Some((scheme, until)) = SCHEMES.lock().unwrap_or_else(|e| e.into_inner()).get(host).copied()
-        && Instant::now() < until
-    {
+    let key = crate::config::canonical(host).unwrap_or_else(|| host.to_ascii_lowercase());
+    if let Some(scheme) = remembered_scheme(&key) {
+        return scheme;
+    }
+    let lock = {
+        let mut probing = PROBING.lock().unwrap_or_else(|e| e.into_inner());
+        probing.retain(|_, l| Arc::strong_count(l) > 1);
+        probing.entry(key.clone()).or_default().clone()
+    };
+    let _one = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Another pull may have asked while this one waited.
+    if let Some(scheme) = remembered_scheme(&key) {
         return scheme;
     }
     // A server that waits instead of refusing a handshake it can't read
     // gets as long as Docker gives a TLS handshake.
     let answers = |url: String, agent: ureq::Agent| agent.get(&url).config().timeout_global(Some(Duration::from_secs(10))).build().call().map(drain).is_ok();
-    let scheme = if answers(format!("https://{host}/v2/"), insecure_agent()) {
-        "https"
+    let (scheme, ttl) = if answers(format!("https://{host}/v2/"), insecure_agent()) {
+        ("https", SCHEME_TTL)
     } else if answers(format!("http://{host}/v2/"), shared_agent()) {
-        "http"
-    } else {
+        ("http", SCHEME_TTL)
+    } else if crate::cancel::current_cancelled() {
+        // Stopped, not unanswered: nothing learnt about the host.
         return "https";
+    } else {
+        ("https", SCHEME_FAILED_TTL)
     };
-    SCHEMES.lock().unwrap_or_else(|e| e.into_inner()).insert(host.to_owned(), (scheme, Instant::now() + SCHEME_TTL));
+    remember_scheme(key, scheme, ttl);
     scheme
 }
 
@@ -1044,8 +1083,10 @@ impl Client {
             .iter()
             .map(|l| Layer { digest: l.digest.clone(), size: l.size, media_type: l.media_type.clone() })
             .collect();
+        // The sizes are the registry's word: a total that overflows is no image.
+        let total = layers.iter().try_fold(0u64, |sum, l| sum.checked_add(l.size)).ok_or_else(|| Error::Manifest("the layers' sizes add up to more than any image".into()))?;
         let cached = layers.iter().filter(|l| store.has_blob(&l.digest, l.size)).count();
-        progress(Progress::Resolved { layers: layers.len(), bytes: layers.iter().map(|l| l.size).sum(), cached });
+        progress(Progress::Resolved { layers: layers.len(), bytes: total, cached });
         for l in &layers {
             progress(Progress::Layer { digest: l.digest.clone(), size: l.size, cached: store.has_blob(&l.digest, l.size) });
         }
@@ -1089,8 +1130,16 @@ impl Client {
                         let result = if cached {
                             Ok(layer.size)
                         } else {
+                            // No more than the manifest says (one byte over is
+                            // what tells a longer body from the end), and
+                            // exactly that.
                             let on_bytes = |got| progress(Progress::Downloading { digest: layer.digest.clone(), got, size: layer.size });
-                            self.download_with(store, target, &layer.digest, u64::MAX, &on_bytes, cancel)
+                            self.download_with(store, target, &layer.digest, layer.size.saturating_add(1), &on_bytes, cancel).and_then(|got| {
+                                if got != layer.size {
+                                    return Err(Error::Manifest(format!("layer {} is {got} bytes, the manifest says {}", layer.digest, layer.size)));
+                                }
+                                Ok(got)
+                            })
                         };
                         match result {
                             Ok(bytes) => progress(Progress::LayerDone { digest: layer.digest.clone(), bytes, cached }),
@@ -1119,7 +1168,7 @@ impl Client {
             digest: digest.clone(),
             index_digest: index_digest.clone(),
             config_digest: config.digest.clone(),
-            size: layers.iter().map(|l| l.size).sum(),
+            size: total,
             layers,
             platform: platform.to_string(),
             created: cfg.created.unwrap_or_default(),
