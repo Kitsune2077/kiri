@@ -13,13 +13,15 @@ use serde_json::{Value, json};
 use kiri_image::{Client, Platform, Progress, Reference};
 use kiri_proto::Stream;
 
+use super::caller::Caller;
 use super::engine::{Container, Engine, Error, ExecConfig, RestartPolicy, Spec, Status};
 use super::filters::Filters;
 use super::http::{self, Request};
 use super::time;
 
-/// Serves one client connection until it closes.
-pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
+/// Serves one client connection until it closes. `caller`: where it
+/// arrived (caller.rs), which decides whether Kiri's settings are open to it.
+pub fn serve(stream: UnixStream, engine: Arc<Engine>, caller: Caller) -> io::Result<()> {
     let mut w = stream.try_clone()?;
     let mut r = BufReader::new(stream);
     while let Some(req) = http::read_request(&mut r, streams_body)? {
@@ -36,7 +38,7 @@ pub fn serve(stream: UnixStream, engine: Arc<Engine>) -> io::Result<()> {
         if req.header("X-Kiri-Background").is_none() {
             engine.touch();
         }
-        match route(&req, &engine, &mut w, &mut r) {
+        match route(&req, &engine, caller, &mut w, &mut r) {
             // `Connection: close` or HTTP/1.0: the client reads to the end of
             // the stream (a 204 has no length to read by), which `close`
             // gives it cleanly.
@@ -117,7 +119,7 @@ fn status_of(e: Error) -> (u16, String) {
     }
 }
 
-fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
+fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
         let (min_major, min_minor) = http::MIN_API_VERSION;
@@ -148,17 +150,21 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         // The window's Stop: off until Start, whatever asks for the VM meanwhile.
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
+        // Settings for this machine's programs only, as Docker has no API
+        // that changes them: not for a container given the socket.
+        ("POST", "/kiri/registries") if caller == Caller::Container => {
+            http::error(w, 403, "the registry settings are changed in Kiri's window or with `kiri registry`, not from a container")?;
+            return Ok(Next::KeepAlive);
+        }
+        ("POST", "/kiri/proxy") | ("PUT", "/kiri/proxy/system") if caller == Caller::Container => {
+            http::error(w, 403, "the proxy settings are changed in Kiri's window, not from a container")?;
+            return Ok(Next::KeepAlive);
+        }
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         // daemon.json's registry keys: Settings → Registries, `kiri registry`.
         ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
-        // Settings for this machine's programs only, as Docker has no API
-        // that changes daemon.json: not for a container given the socket.
-        ("POST", "/kiri/registries") if super::caller::is_container(w) => {
-            http::error(w, 403, "the registry settings are changed in Kiri's window or with `kiri registry`, not from a container")?;
-            return Ok(Next::KeepAlive);
-        }
         ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.
@@ -4028,7 +4034,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.write_all(requests.as_bytes()).unwrap();
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
@@ -4074,7 +4080,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
             // Written from a thread: a body larger than the socket buffer
@@ -4138,7 +4144,7 @@ mod tests {
             let t = std::time::Instant::now();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || (serve(server, engine), t.elapsed())
+                move || (serve(server, engine, Caller::Host), t.elapsed())
             });
             client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let sent = std::thread::spawn({
@@ -4224,7 +4230,7 @@ mod tests {
             let (mut client, server) = UnixStream::pair().unwrap();
             let served = std::thread::spawn({
                 let engine = engine.clone();
-                move || serve(server, engine)
+                move || serve(server, engine, Caller::Host)
             });
             write!(client, "POST /images/load?quiet=0 HTTP/1.1\r\nHost: docker\r\nContent-Type: application/x-tar\r\nContent-Length: {}\r\n\r\n", body.len()).unwrap();
             client.write_all(body).unwrap();

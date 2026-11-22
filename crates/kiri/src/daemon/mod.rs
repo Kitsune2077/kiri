@@ -121,13 +121,29 @@ pub fn run(_args: &[String]) -> io::Result<()> {
     if let Some(group) = &access_group {
         socket_group(&socket, group)?;
     }
+    // On a Linux host (and WSL) containers that mount the engine's socket
+    // are given this one instead (binds.rs), so the API knows their
+    // connections by where they arrive (caller.rs). Made as the daemon's
+    // own is, for the same users. A Mac's containers come through the VM's
+    // relay (ports::serve_engine_api).
+    #[cfg(target_os = "linux")]
+    let for_containers = {
+        let path = caller::container_socket(&socket);
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path)?;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+        if let Some(group) = &access_group {
+            socket_group(&path, group)?;
+        }
+        (listener, path)
+    };
     // Each member by name too, so one just added needn't sign in again; and
     // connections are checked against the group when made and while open, so
     // a member removed is let go at once, whatever the list still says.
     #[cfg(target_os = "linux")]
     let gate = match &access_group {
         Some(group) => {
-            let gate = access::Gate::new(&socket, group)?;
+            let gate = access::Gate::new(&[socket.as_path(), for_containers.1.as_path()], group)?;
             match gate.grant() {
                 Ok(n) => diag::info!("socket access list written", members = n),
                 Err(e) => diag::warn!("socket access list not written: new members sign in again first", error = e),
@@ -195,12 +211,31 @@ pub fn run(_args: &[String]) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         nfs::unmount();
         let _ = std::fs::remove_file(&sock);
+        let _ = std::fs::remove_file(caller::container_socket(&sock));
         on_signal.shutdown();
         // Give the guest a moment to power off before the VM is released.
         std::thread::sleep(std::time::Duration::from_millis(50));
         std::process::exit(0);
     })?;
 
+    #[cfg(target_os = "linux")]
+    {
+        let (engine2, gate2) = (engine.clone(), gate.clone());
+        std::thread::Builder::new().name("kiri-api-containers".into()).spawn(move || accept(&for_containers.0, &engine2, &gate2, caller::Caller::Container))?;
+        accept(&listener, &engine, &gate, caller::Caller::Host);
+    }
+    #[cfg(not(target_os = "linux"))]
+    accept(&listener, &engine, caller::Caller::Host);
+    Ok(())
+}
+
+/// Serves each connection `listener` takes, as `who`'s, on a thread of its own.
+fn accept(
+    listener: &UnixListener,
+    engine: &std::sync::Arc<engine::Engine>,
+    #[cfg(target_os = "linux")] gate: &Option<std::sync::Arc<access::Gate>>,
+    who: caller::Caller,
+) {
     for conn in listener.incoming() {
         let Ok(conn) = conn else { continue };
         let engine = engine.clone();
@@ -217,13 +252,12 @@ pub fn run(_args: &[String]) -> io::Result<()> {
                 },
                 None => None,
             };
-            let _ = api::serve(conn, engine);
+            let _ = api::serve(conn, engine, who);
         });
         if let Err(e) = spawned {
             diag::error!("cannot start a connection thread", error = e);
         }
     }
-    Ok(())
 }
 
 /// When the app this daemon runs from is deleted (appwatch.rs): docker
@@ -238,6 +272,7 @@ fn watch_own_app(engine: std::sync::Arc<engine::Engine>, socket: std::path::Path
         #[cfg(target_os = "macos")]
         nfs::unmount();
         let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(caller::container_socket(&socket));
         engine.shutdown();
         std::thread::sleep(Duration::from_millis(50));
         // 0: launchd restarts the engine on failure only, and there is

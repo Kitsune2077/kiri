@@ -1059,8 +1059,7 @@ pub fn serve_engine_api(stream: kiri_vmm::VsockStream, engine: std::sync::Weak<s
         let Some(engine) = engine.upgrade() else { return };
         let Ok((api, ours)) = std::os::unix::net::UnixStream::pair() else { return };
         let served = std::thread::Builder::new().name("kiri-api".into()).spawn(move || {
-            super::caller::mark_container();
-            let _ = super::api::serve(ours, engine);
+            let _ = super::api::serve(ours, engine, super::caller::Caller::Container);
         });
         if served.is_err() {
             return;

@@ -97,6 +97,9 @@ for c in version cmd keepalive close follow follow-created timestamps; do
   t "testcontainers-$c" "ok $c" "for i in \$(seq 60); do command -v python3 >/dev/null && break; sleep 1; done; python3 /testcontainers-api.py /root/.kiri/run/docker.sock $c"
 done
 t socket-mount-reaches-kiri "Kiri" "docker run --rm -v /root/.kiri/run/docker.sock:/var/run/docker.sock docker:cli docker version --format '{{.Server.Platform.Name}}'"
+# A container given the engine's socket uses Docker's API, not Kiri's own
+# settings: the same CLI that changes them here is refused from inside one.
+t socket-mount-settings-refused "not from a container" "docker run --rm -v /opt/kiri/kiri:/kiri:ro -v /root/.kiri/run/docker.sock:/var/run/docker.sock -e KIRI_SOCKET=/var/run/docker.sock alpine /kiri registry insecure add 10.9.9.9:5000 2>&1"
 t stats "web" "docker stats --no-stream --format '{{.Name}}'"
 t network-dns "PONG" "docker network create lhn >/dev/null 2>&1; docker run -d --name db --network lhn redis:7-alpine >/dev/null; sleep 1; docker run --rm --network lhn redis:7-alpine redis-cli -h db ping"
 t bind-host-path "3." "docker run --rm -v /etc:/h:ro alpine cat /h/alpine-release"
