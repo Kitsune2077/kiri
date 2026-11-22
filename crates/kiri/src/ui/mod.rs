@@ -557,22 +557,33 @@ fn proxy(save: Option<serde_json::Value>) {
 }
 
 /// Settings → Registries: reads (or saves, then reads) daemon.json's
-/// insecure registries and Docker Hub mirrors.
+/// insecure registries and Docker Hub mirrors. The answer to a save says
+/// whether it was saved (`saved`), so the page knows its own save's answer
+/// from a read that crossed it.
 fn registry_config(save: Option<serde_json::Value>) {
-    if let Some(body) = save {
-        match client::request("POST", "/kiri/registries", Some(&body)) {
-            Ok(r) if r.ok() => emit(notice("ok", &tr("Registry settings saved"))),
-            Ok(r) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &r.error())]))),
-            Err(e) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)]))),
+    let saved = save.map(|body| match client::request("POST", "/kiri/registries", Some(&body)) {
+        Ok(r) if r.ok() => {
+            emit(notice("ok", &tr("Registry settings saved")));
+            true
         }
-    }
-    match client::get("/kiri/registries") {
-        Ok(mut v) => {
-            v["type"] = "registryconfig".into();
-            emit(v.to_string());
+        Ok(r) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &r.error())])));
+            false
         }
-        Err(e) => emit(serde_json::json!({"type": "registryconfig", "error": e.to_string()}).to_string()),
+        Err(e) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)])));
+            false
+        }
+    });
+    let mut v = match client::get("/kiri/registries") {
+        Ok(v) => v,
+        Err(e) => serde_json::json!({"error": e.to_string()}),
+    };
+    v["type"] = "registryconfig".into();
+    if let Some(saved) = saved {
+        v["saved"] = saved.into();
     }
+    emit(v.to_string());
 }
 
 /// Settings → Domains: reads (or moves, then reads) the routers' ports.

@@ -1493,20 +1493,27 @@ fn proxy(set: Option<Value>) {
 
 /// Settings → Registries: the engine's daemon.json (in its WSL distro):
 /// insecure registries and Docker Hub mirrors.
+/// The answer to a save says whether it was saved (`saved`), so the page
+/// knows its own save's answer from a read that crossed it.
 fn registry_config(set: Option<Value>) {
-    if let Some(body) = set {
-        match expect_ok(client::request("POST", "/kiri/registries", Some(&body))) {
-            Ok(()) => emit(notice("ok", &tr("Registry settings saved"))),
-            Err(e) => emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)]))),
+    let saved = set.map(|body| match expect_ok(client::request("POST", "/kiri/registries", Some(&body))) {
+        Ok(()) => {
+            emit(notice("ok", &tr("Registry settings saved")));
+            true
         }
-    }
-    let ev = match client::get("/kiri/registries") {
-        Ok(mut v) => {
-            v["type"] = json!("registryconfig");
-            v
+        Err(e) => {
+            emit(notice("error", &trf("Could not save the registry settings: {error}", &[("error", &e)])));
+            false
         }
-        Err(e) => json!({"type": "registryconfig", "error": e.to_string()}),
+    });
+    let mut ev = match client::get("/kiri/registries") {
+        Ok(v) => v,
+        Err(e) => json!({"error": e.to_string()}),
     };
+    ev["type"] = json!("registryconfig");
+    if let Some(saved) = saved {
+        ev["saved"] = json!(saved);
+    }
     emit(ev.to_string());
 }
 

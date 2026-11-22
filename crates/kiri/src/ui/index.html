@@ -2778,7 +2778,7 @@ const VM = LINUX ? "Engine" : "Linux VM";
 const shareOn = () => !!(ui.status?.share ?? ui.status?.dev);
 const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
 
-const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" },
+const ui = { acting: new Map(), gacting: new Map(), running: new Set(), launched: new Map(), runWatch: new Map(), need: null, probed: new Map(), probing: new Set(), why: new Map(), startErr: {}, fixed: null, openTab: null, listening: new Map(), starting: new Map(), scans: new Map(), scanf: { sev: "", fix: false, own: false }, view: "containers", vm: "stopped", containers: [], images: [], volumes: [], networks: [], sort: { images: { key: "pulled", desc: true } }, filter: "", suffix: "kiri.localhost", collapsed: new Set(), res: null, resDraft: {}, proxy: null, pxDraft: {}, rports: null, rpDraft: {}, rpAt: 0, regcfg: null, regBase: null, regDraft: { insecure: [], mirrors: [] }, regAdd: { insecure: "", mirrors: "" },
   imp: { sources: null, source: null, inv: null, picked: { images: new Set(), volumes: new Set(), containers: new Set() }, steps: {}, running: false, summary: "" },
   upd: null, engineStale: null, staleHidden: false,
   // The Builds view: the list, the picked build and its detail, and how its steps show.
@@ -8185,19 +8185,27 @@ window.kiri = {
       case "routerports": ui.rports = e; ui.rpDraft = {}; render(); break;
       case "proxy": ui.proxy = e; ui.pxDraft = { ...(e.settings || {}) }; if (ui.view === "settings") render(); break;
       case "registryconfig": {
-        // A list with edits not yet saved keeps them: saving the other list
-        // (or a save the daemon refused, which answers with the file as it
-        // was) must not throw them away. A list takes the file's version
-        // when it has no edits, or when it is the one just saved and the file
-        // changed.
-        const was = ui.regcfg, saving = ui.regSaving; ui.regSaving = null;
-        const keys = { insecure: "insecure-registries", mirrors: "registry-mirrors" };
-        const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
-        for (const k of Object.keys(keys)) {
-          const fresh = e[keys[k]] || [], before = was ? was[keys[k]] : null;
-          const clean = !was || was.error || same(ui.regDraft[k], before);
-          const savedNow = saving === k && !same(fresh, before);
-          if (clean || savedNow) { ui.regDraft[k] = [...fresh]; ui.regAdd[k] = ""; }
+        // A list with edits not yet saved keeps them: saving the other list,
+        // a save the daemon refused, a read that crossed a save, or a daemon
+        // that went away must not throw them away. A list takes the file's
+        // version when it has no edits (against the last file read), or when
+        // it is the one this save saved (`saved`, only on a save's answer),
+        // even if the file reads the same as before (the save wrote what
+        // was typed in the file's own spelling). What is typed in a field
+        // and not added yet goes only with its own list's save.
+        const answer = "saved" in e, saving = answer ? ui.regSaving : null;
+        if (answer) ui.regSaving = null;
+        if (!e.error) {
+          const base = ui.regBase;
+          const same = (a, b) => JSON.stringify(a || []) === JSON.stringify(b || []);
+          for (const k of Object.keys(REG_KEY)) {
+            const fresh = e[REG_KEY[k]] || [];
+            const clean = !base || same(ui.regDraft[k], base[REG_KEY[k]]);
+            const savedNow = saving === k && e.saved === true;
+            if (clean || savedNow) ui.regDraft[k] = [...fresh];
+            if (savedNow) ui.regAdd[k] = "";
+          }
+          ui.regBase = e;
         }
         ui.regcfg = e;
         if (ui.view === "settings") render();
