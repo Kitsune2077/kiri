@@ -435,13 +435,12 @@ fn builder_state(engine: &Engine) -> Option<BuilderState> {
 /// `POST /containers/<builder>/exec` from buildx (its docker-container
 /// driver talks to buildkitd through an exec): a builder whose config is not
 /// today's, with nothing else using it, is restarted with today's first, so
-/// a build buildx starts reaches each registry as a pull does.
+/// a build buildx starts reaches each registry as a pull does. Enters
+/// [`ENSURE`] for every builder exec so concurrent execs wait for an
+/// in-progress restart or start to finish before `exec_create` runs.
 pub fn before_exec(engine: &Engine, key: &str) {
     // One lookup for an exec anywhere else.
-    let Ok((id, status, true)) = engine.with(key, |c| (c.id.clone(), c.status, c.name == container_name())) else { return };
-    if !restart_now(status == Status::Running, builder_busy(engine, &id), stale_now(engine)) {
-        return;
-    }
+    let Ok(true) = engine.with(key, |c| c.name == container_name()) else { return };
     before_exec_with(
         &ENSURE,
         || builder_state(engine),
@@ -1502,6 +1501,59 @@ mod tests {
             |id| log.borrow_mut().push(format!("start:{id}")),
         );
         assert_eq!(*log.borrow(), ["stop:b2", "resume", "stop", "write", "start:b2"]);
+    }
+
+    /// `before_exec` enters `ENSURE` for the builder without an unlocked
+    /// `restart_now` early return, so a concurrent exec waits while another
+    /// request is restarting or starting the builder; execs for other
+    /// containers never block on `ENSURE`.
+    #[test]
+    fn before_exec_waits_on_ensure_while_builder_is_restarting() {
+        use std::io::Write as _;
+        let dir = std::env::temp_dir().join(format!("kiri-builder-before-exec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = kiri_image::Store::open(&dir).unwrap();
+        let cfg = json!({"created": "2026-11-16T00:00:00Z", "architecture": "arm64", "os": "linux", "config": {"Cmd": ["sh"]}});
+        let mut w = store.ingest().unwrap();
+        w.write_all(&serde_json::to_vec(&cfg).unwrap()).unwrap();
+        let (digest, _) = w.finish().unwrap();
+        store.put_image(kiri_image::archive::from_config("demo:1".into(), &digest, &cfg, Vec::new())).unwrap();
+        let engine = Engine::boot(store).unwrap();
+        let make = |name: &str| {
+            let body = json!({"Image": "demo:1", "HostConfig": {"NetworkMode": "none"}});
+            let req = Request::internal("POST", "/containers/create", &[("name", name)], serde_json::to_vec(&body).unwrap());
+            api::create(&req, &engine).unwrap()["Id"].as_str().unwrap().to_owned()
+        };
+        let builder_id = make(&container_name());
+        let other_id = make("other");
+
+        // Hold ENSURE to simulate an in-progress builder restart (where the
+        // builder is momentarily not running: Status::Created / Exited).
+        let held = ENSURE.lock().unwrap_or_else(|e| e.into_inner());
+
+        // Exec on a non-builder container returns without waiting on ENSURE.
+        before_exec(&engine, &other_id);
+
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let waiter = std::thread::spawn({
+            let (engine, builder_id) = (engine.clone(), builder_id.clone());
+            move || {
+                let _ = entered_tx.send(());
+                before_exec(&engine, &builder_id);
+                let _ = done_tx.send(());
+            }
+        });
+        entered_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let waited = matches!(done_rx.recv_timeout(Duration::from_millis(100)), Err(RecvTimeoutError::Timeout));
+        drop(held);
+        if waited {
+            done_rx.recv_timeout(Duration::from_secs(2)).expect("waiter must resume once ENSURE is released");
+        }
+        waiter.join().unwrap();
+        drop(engine);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(waited, "before_exec must wait on ENSURE while the builder is stopped mid-restart");
     }
 
     #[test]
