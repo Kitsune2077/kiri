@@ -493,7 +493,9 @@ fn is_own_origin(final_url: &str, base: &str) -> bool {
 fn origin_of(url: &str) -> Option<(bool, String, u16)> {
     let uri: ureq::http::Uri = url.parse().ok()?;
     let https = uri.scheme_str()?.eq_ignore_ascii_case("https");
-    let host = uri.host()?.to_ascii_lowercase();
+    let host = uri.host()?;
+    // One spelling per host: `[fd00:0::1]` and `[fd00::1]` are one address.
+    let host = crate::config::canonical(host).unwrap_or_else(|| host.to_ascii_lowercase());
     Some((https, host, uri.port_u16().unwrap_or(if https { 443 } else { 80 })))
 }
 
@@ -715,15 +717,13 @@ impl Client {
         self
     }
 
-    /// `https://host`, `http://host` for a registry on this machine or an
-    /// `http://` mirror, and for an `insecure-registries` host whichever of
-    /// the two it answers on (HTTPS first, its certificate unchecked).
+    /// `https://host`, and for a registry on this machine or in
+    /// `insecure-registries` whichever of HTTPS (its certificate unchecked)
+    /// and plain HTTP it answers on, HTTPS first. A mirror written `http://`
+    /// is one of those (see [`RegistryConfig::mirror_allowed`]).
     fn base(&self, host: &str) -> String {
-        // The client a mirror is asked with: no credentials, no mirrors.
-        let as_mirror = !self.use_mirrors && self.credentials.is_none();
-        let scheme = match self.config.reach(host, as_mirror) {
+        let scheme = match self.config.reach(host) {
             Reach::Https => "https",
-            Reach::Http => "http",
             Reach::Insecure => insecure_scheme(host),
         };
         format!("{scheme}://{host}")
@@ -854,8 +854,11 @@ impl Client {
         self
     }
 
-    fn mirrors(&self) -> &[Mirror] {
-        if self.use_mirrors { &self.config.mirrors } else { &[] }
+    /// The mirrors this client's Docker Hub pulls try: none for the client a
+    /// mirror is itself asked with, and only the usable ones
+    /// ([`RegistryConfig::mirror_allowed`]).
+    fn mirrors(&self) -> Vec<&Mirror> {
+        if self.use_mirrors { self.config.usable_mirrors().collect() } else { Vec::new() }
     }
 
     /// The same connection pool and settings, no credentials and no
@@ -1505,8 +1508,8 @@ impl Client {
     /// `docker login`: checks the credentials against the registry at
     /// `server` (`https://index.docker.io/v1/`, `ghcr.io`, `localhost:5000`).
     pub fn login(&self, server: &str) -> Result<(), Error> {
-        let host = server.trim_start_matches("https://").trim_start_matches("http://").split('/').next().unwrap_or_default();
-        let host = if host.is_empty() || host == "index.docker.io" || host == "docker.io" { "registry-1.docker.io" } else { host };
+        let host = login_host(server)?;
+        let host = host.as_str();
         let url = format!("{}/v2/", self.base(host));
         let resp = self.get_following(&url, host, None, &[], &[])?;
         match resp.status().as_u16() {
@@ -1520,7 +1523,10 @@ impl Client {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
                     let (auth, _) = self.answer(&challenge, "", host)?;
-                    let again = self.get_following(&url, host, Some(&auth), &[], &[])?;
+                    // Where the challenge came from: the registry moved up to
+                    // HTTPS answers there, not at the plain-HTTP address.
+                    let at = final_url(&resp).unwrap_or_else(|| url.clone());
+                    let again = self.get_following(&at, host, Some(&auth), &[], &[])?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
                         s => Err(Error::Status { url, status: s, body: "unauthorized: incorrect username or password".into() }),
@@ -1609,6 +1615,36 @@ impl Client {
         ok(put, &url)?;
         Ok((sha256_digest(&bytes), bytes.len() as u64))
     }
+}
+
+/// The registry host a `docker login` server names: `https://index.docker.io/v1/`,
+/// `ghcr.io`, `localhost:5000`, `HTTP://Registry.LAN:5000/`. Docker Hub's
+/// names (any case, a trailing dot, its port) are its API host. Anything
+/// that is not a plain `host[:port]` after the scheme and before the path,
+/// a user name (`x@host`), a query or a fragment among them, is refused.
+fn login_host(server: &str) -> Result<String, Error> {
+    let text = server.trim();
+    let lower = text.to_ascii_lowercase();
+    let rest = lower.strip_prefix("https://").or_else(|| lower.strip_prefix("http://")).unwrap_or(&lower);
+    if rest.contains(['@', '?', '#', '\\']) {
+        return Err(Error::Http(format!("not a registry address: {text}")));
+    }
+    let host = rest.split('/').next().unwrap_or_default();
+    if host.is_empty() || crate::config::is_hub(host) {
+        return Ok("registry-1.docker.io".into());
+    }
+    crate::config::canonical(host).ok_or_else(|| Error::Http(format!("not a registry address: {text}")))
+}
+
+/// Text a remote server sent, safe to print: control characters (a
+/// terminal's escape sequences among them) become spaces, and it is cut at
+/// 200 characters.
+fn printable(text: &str) -> String {
+    let mut out: String = text.chars().take(200).map(|c| if c.is_control() { ' ' } else { c }).collect();
+    if text.chars().nth(200).is_some() {
+        out.push('…');
+    }
+    out
 }
 
 /// Parses `Bearer realm="…",service="…",scope="…"`.
@@ -2861,6 +2897,7 @@ mod tests {
         assert!(!is_own_origin("http://r.lan/x", "https://r.lan"), "https down to http");
         assert!(!is_own_origin("http://r.lan:81/x", "http://r.lan"));
         assert!(!is_own_origin("not a url", "http://r.lan"));
+        assert!(is_own_origin("http://[fd00:0::1]:5000/v2/", "http://[FD00::1]:5000"));
     }
 
     #[test]

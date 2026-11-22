@@ -5,16 +5,23 @@
 //!   (`10.0.0.0/8`) reached without a verified certificate. HTTPS is tried
 //!   first without checking the certificate, then plain HTTP. Only the
 //!   hosts listed: every other registry keeps verified HTTPS, and
-//!   credentials only ever go in the clear to a listed host.
+//!   credentials only ever go in the clear to a listed host. A network
+//!   covers registries named by an address in it (`10.1.2.3:5000`); a
+//!   registry named by a host name is covered only when that name is
+//!   listed, whatever it resolves to.
 //! - `registry-mirrors`: pull-through mirrors of Docker Hub ([`Mirror`]).
 //!
 //! The daemon reads the file and hands each client a snapshot
 //! ([`crate::registry::set_config_source`]).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use crate::mirror::Mirror;
 use crate::reference::is_local;
+
+/// The longest host name DNS allows, and the longest label in one.
+const MAX_NAME: usize = 253;
+const MAX_LABEL: usize = 63;
 
 /// One `insecure-registries` entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,16 +29,17 @@ pub enum Insecure {
     /// `host` or `host:port`, matched as written, as Docker matches it: an
     /// entry without a port does not cover the same host with one.
     Host(String),
-    /// A network in CIDR form: covers a registry whose address is in it.
+    /// A network in CIDR form: covers a registry named by an address in it.
     Net(IpAddr, u8),
 }
 
 impl Insecure {
     /// Docker's spellings: `registry.lan:5000`, `registry.lan`,
     /// `192.168.1.10:5000`, `[fd00::1]:5000`, `10.0.0.0/8`. An `http://` or
-    /// `https://` in front is dropped, as Docker drops it. Docker Hub, and a
-    /// network that is every address, are refused: insecure is for named
-    /// hosts, never for everything.
+    /// `https://` in front is dropped, as Docker drops it. Docker Hub is
+    /// refused, and so is a network wide enough to take in much of the
+    /// internet ([`narrow_enough`]): insecure is for named hosts and the
+    /// networks they are on, never for everything.
     pub fn parse(input: &str) -> Result<Insecure, String> {
         let text = input.trim();
         let lower = text.to_ascii_lowercase();
@@ -42,19 +50,18 @@ impl Insecure {
         if let Some((ip, bits)) = bare.split_once('/') {
             let ip: IpAddr = ip.parse().map_err(|_| format!("not a host or a network: {text}"))?;
             let max = if ip.is_ipv4() { 32 } else { 128 };
-            let bits: u8 = bits.parse().ok().filter(|&b| b <= max).ok_or_else(|| format!("not a network: {text}"))?;
-            if bits == 0 {
-                return Err(format!("{text} is every address: list the registries' hosts or networks instead"));
+            let bits: u8 = Some(bits).filter(|b| !b.is_empty() && b.len() <= 3 && b.bytes().all(|c| c.is_ascii_digit())).and_then(|b| b.parse().ok()).filter(|&b| b <= max).ok_or_else(|| format!("not a network: {text}"))?;
+            let net = mask(ip, bits);
+            if !narrow_enough(net, bits) {
+                return Err(format!("{text} takes in addresses on the internet: list the registries' hosts, or a private network such as 10.0.0.0/8"));
             }
-            return Ok(Insecure::Net(mask(ip, bits), bits));
+            return Ok(Insecure::Net(net, bits));
         }
-        if !valid_host(bare) {
-            return Err(format!("not a host or a network: {text}"));
-        }
-        if is_hub(bare) {
+        let host = canonical(bare).ok_or_else(|| format!("not a host or a network: {text}"))?;
+        if is_hub(&host) {
             return Err("Docker Hub is always reached over verified HTTPS".into());
         }
-        Ok(Insecure::Host(bare.to_owned()))
+        Ok(Insecure::Host(host))
     }
 
     /// As daemon.json keeps it.
@@ -66,64 +73,77 @@ impl Insecure {
     }
 }
 
-/// `host[:port]` with a host made of name characters, an IPv4 address, or
-/// an IPv6 address in brackets.
-fn valid_host(s: &str) -> bool {
-    let label = |l: &str| !l.is_empty() && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
-    let (host_ok, port) = if let Some(rest) = s.strip_prefix('[') {
-        let Some((ip, after)) = rest.split_once(']') else { return false };
+/// Whether a network may be listed: one inside the ranges that are never on
+/// the internet (private, shared, loopback, link-local and unique-local
+/// addresses), or a small one anywhere (a /16 or longer for IPv4, a /48 or
+/// longer for IPv6). A few short networks (`0.0.0.0/1` and `128.0.0.0/1`)
+/// would otherwise make every registry named by its address insecure.
+fn narrow_enough(net: IpAddr, bits: u8) -> bool {
+    let inside = |base: IpAddr, len: u8| bits >= len && mask(net, len) == base;
+    let v4 = |a: [u8; 4], len: u8| inside(IpAddr::V4(Ipv4Addr::from(a)), len);
+    let v6 = |a: &str, len: u8| a.parse::<Ipv6Addr>().is_ok_and(|a| inside(IpAddr::V6(a), len));
+    match net {
+        IpAddr::V4(_) => {
+            bits >= 16
+                || v4([10, 0, 0, 0], 8)
+                || v4([172, 16, 0, 0], 12)
+                || v4([192, 168, 0, 0], 16)
+                || v4([100, 64, 0, 0], 10)
+                || v4([127, 0, 0, 0], 8)
+                || v4([169, 254, 0, 0], 16)
+        }
+        IpAddr::V6(_) => bits >= 48 || v6("fc00::", 7) || v6("fe80::", 10) || v6("::1", 128),
+    }
+}
+
+/// `host[:port]` as it is matched: lowercase, an IPv6 address in its
+/// shortest form (`[fd00:0::1]` is `[fd00::1]`), a port of plain digits.
+/// `None` for anything that is not a host: a name of letters, digits, `-`
+/// and `_` in labels DNS allows, an IPv4 address, or an IPv6 address in
+/// brackets, with an optional port from 1 to 65535. A user name (`@`), a
+/// path, a query or anything else makes it no host at all.
+pub fn canonical(s: &str) -> Option<String> {
+    let s = s.to_ascii_lowercase();
+    let label = |l: &str| !l.is_empty() && l.len() <= MAX_LABEL && l.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    let port_ok = |p: &str| !p.is_empty() && p.len() <= 5 && p.bytes().all(|b| b.is_ascii_digit()) && !p.starts_with('0') && p.parse::<u32>().is_ok_and(|p| (1..=65535).contains(&p));
+    let (host, port) = if let Some(rest) = s.strip_prefix('[') {
+        let (ip, after) = rest.split_once(']')?;
+        let ip: Ipv6Addr = ip.parse().ok()?;
         let port = match after {
             "" => None,
-            a => match a.strip_prefix(':') {
-                Some(p) => Some(p),
-                None => return false,
-            },
+            a => Some(a.strip_prefix(':')?),
         };
-        (ip.parse::<std::net::Ipv6Addr>().is_ok(), port)
+        (format!("[{ip}]"), port)
     } else {
-        let (h, p) = s.rsplit_once(':').map_or((s, None), |(h, p)| (h, Some(p)));
-        (h.split('.').all(label), p)
+        let (h, p) = s.rsplit_once(':').map_or((s.as_str(), None), |(h, p)| (h, Some(p)));
+        if h.len() > MAX_NAME || !h.split('.').all(label) {
+            return None;
+        }
+        (h.to_owned(), p)
     };
-    host_ok && port.is_none_or(|p| p.parse::<u16>().is_ok_and(|p| p > 0))
+    match port {
+        None => Some(host),
+        Some(p) if port_ok(p) => Some(format!("{host}:{p}")),
+        Some(_) => None,
+    }
 }
 
 /// Docker Hub's names. Hub is always reached over verified HTTPS: no
 /// setting, and no address the name resolves to, changes that.
 pub fn is_hub(host: &str) -> bool {
     let name = host_name(host);
-    ["docker.io", "index.docker.io", "registry-1.docker.io"].iter().any(|h| name.eq_ignore_ascii_case(h))
+    ["docker.io", "index.docker.io", "registry-1.docker.io", "registry.hub.docker.com", "auth.docker.io"].iter().any(|h| name.eq_ignore_ascii_case(h))
 }
 
-/// The host of `host[:port]` or `[v6]:port`, without the port.
+/// The host of `host[:port]` or `[v6]:port`, without the port, and without
+/// whatever a `user@` in front would hide it behind.
 fn host_name(s: &str) -> &str {
+    let s = s.rsplit('@').next().unwrap_or(s);
     if let Some(rest) = s.strip_prefix('[') {
         return rest.split(']').next().unwrap_or(rest);
     }
     // `registry-1.docker.io.` (a trailing dot) is the same name.
     s.rsplit_once(':').map_or(s, |(h, _)| h).trim_end_matches('.')
-}
-
-/// A name's addresses, for a network entry. Asked of the system's resolver,
-/// as the connection to it will be, and kept a minute: a pull asks for each
-/// layer, and the answer is the same.
-fn lookup(name: &str) -> Vec<IpAddr> {
-    use std::collections::HashMap;
-    use std::sync::{LazyLock, Mutex};
-    use std::time::{Duration, Instant};
-    type Seen = HashMap<String, (Vec<IpAddr>, Instant)>;
-    static SEEN: LazyLock<Mutex<Seen>> = LazyLock::new(Default::default);
-    if let Some((addrs, at)) = SEEN.lock().unwrap_or_else(|e| e.into_inner()).get(name)
-        && at.elapsed() < Duration::from_secs(60)
-    {
-        return addrs.clone();
-    }
-    let addrs: Vec<IpAddr> = std::net::ToSocketAddrs::to_socket_addrs(&(name, 0)).map(|a| a.map(|a| a.ip()).collect()).unwrap_or_default();
-    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
-    if seen.len() > 256 {
-        seen.clear();
-    }
-    seen.insert(name.to_owned(), (addrs.clone(), Instant::now()));
-    addrs
 }
 
 fn mask(ip: IpAddr, bits: u8) -> IpAddr {
@@ -144,8 +164,6 @@ fn mask(ip: IpAddr, bits: u8) -> IpAddr {
 pub enum Reach {
     /// Verified HTTPS: every registry nothing below covers.
     Https,
-    /// Plain HTTP: a mirror written `http://` when it is asked as the mirror.
-    Http,
     /// A registry on this machine (Docker treats loopback as insecure) or
     /// listed in `insecure-registries`: HTTPS without checking the
     /// certificate, else plain HTTP.
@@ -162,73 +180,74 @@ pub struct RegistryConfig {
 
 impl RegistryConfig {
     /// Whether `host` (`registry.lan:5000`, as a reference names it) is
-    /// listed in `insecure-registries`. A network entry covers an address
-    /// in it, and a name whose address (looked up as a connection to it
-    /// would be) is; names are only looked up when a network is listed.
-    /// Docker Hub never is, whatever its name resolves to, and with an empty
-    /// list nothing is looked up.
-    ///
-    /// A name resolving to several addresses is covered when any is in the
-    /// network, and the connection to it may then pick another: Docker
-    /// matches networks the same way, and the registries a network lists
-    /// are on the same LAN.
+    /// listed in `insecure-registries`: written in the list, or named by an
+    /// address inside a listed network. A host name is never looked up for
+    /// a network: what it resolves to can change between the check and the
+    /// connection, and a name with several addresses would be checked
+    /// against one and reached at another. Docker Hub never is, and nothing
+    /// that is not a plain `host[:port]` is.
     pub fn is_insecure(&self, host: &str) -> bool {
         if self.insecure.is_empty() || is_hub(host) {
             return false;
         }
-        let host = host.to_ascii_lowercase();
-        if self.is_listed_host(&host) {
+        let Some(host) = canonical(host) else { return false };
+        if self.insecure.iter().any(|e| matches!(e, Insecure::Host(h) if *h == host)) {
             return true;
         }
-        if !self.insecure.iter().any(|e| matches!(e, Insecure::Net(..))) {
-            return false;
-        }
-        let name = host_name(&host);
-        let addrs: Vec<IpAddr> = match name.parse::<IpAddr>() {
-            Ok(ip) => vec![ip],
-            Err(_) => lookup(name),
-        };
+        let Some(ip) = host_ip(&host) else { return false };
         self.insecure.iter().any(|e| match e {
-            Insecure::Net(net, bits) => addrs.iter().any(|ip| ip.is_ipv4() == net.is_ipv4() && mask(*ip, *bits) == *net),
+            Insecure::Net(net, bits) => ip.is_ipv4() == net.is_ipv4() && mask(ip, *bits) == *net,
             Insecure::Host(_) => false,
         })
     }
 
     /// Whether `host` is written in the list as a host (not reached by a
     /// network): the only way a registry may name another host for its
-    /// token service or its blobs and have unchecked TLS or plain HTTP.
+    /// blobs and have unchecked TLS or plain HTTP.
     pub fn is_listed_host(&self, host: &str) -> bool {
         if is_hub(host) {
             return false;
         }
-        let host = host.to_ascii_lowercase();
+        let Some(host) = canonical(host) else { return false };
         self.insecure.iter().any(|e| matches!(e, Insecure::Host(h) if *h == host))
     }
 
     /// Whether `host` may be reached without a verified certificate: a
     /// registry on this machine, as Docker treats loopback, or one in the
-    /// list. Docker Hub never.
+    /// list. Docker Hub never, and nothing that is not a plain host.
     pub fn is_unverified(&self, host: &str) -> bool {
-        !is_hub(host) && (is_local(host) || self.is_insecure(host))
+        !is_hub(host) && canonical(host).is_some() && (is_local(host) || self.is_insecure(host))
     }
 
     /// How `host` is reached: Docker Hub always verified, loopback and listed
     /// hosts insecure (HTTPS unchecked, else plain HTTP, as Docker does),
-    /// the rest over verified HTTPS. `as_mirror` is a pull of a Docker Hub
-    /// image from a mirror (never with credentials): a mirror written
-    /// `http://` is asked over plain HTTP then, as Docker asks it, but the
-    /// same host named as a registry is like any other.
-    pub fn reach(&self, host: &str, as_mirror: bool) -> Reach {
-        if is_hub(host) {
-            Reach::Https
-        } else if as_mirror && self.mirrors.iter().any(|m| m.http && m.host == host) {
-            Reach::Http
-        } else if self.is_unverified(host) {
-            Reach::Insecure
-        } else {
-            Reach::Https
-        }
+    /// the rest over verified HTTPS.
+    pub fn reach(&self, host: &str) -> Reach {
+        if self.is_unverified(host) { Reach::Insecure } else { Reach::Https }
     }
+
+    /// Whether `mirror` may be used: one written `https://` always; one
+    /// written `http://` only when its host may go without verified TLS
+    /// anyway (on this machine, or in `insecure-registries`), so that a
+    /// build and a pull reach it the same way, and the answers a pull takes
+    /// for Docker Hub's never cross the network in the clear from a host
+    /// nobody marked insecure.
+    pub fn mirror_allowed(&self, mirror: &Mirror) -> bool {
+        !mirror.http || mirror.is_local() || self.is_unverified(&mirror.host)
+    }
+
+    /// The mirrors a pull of a Docker Hub image tries, in order.
+    pub fn usable_mirrors(&self) -> impl Iterator<Item = &Mirror> {
+        self.mirrors.iter().filter(|m| self.mirror_allowed(m))
+    }
+}
+
+/// The address a canonical `host[:port]` names, if it is one.
+fn host_ip(host: &str) -> Option<IpAddr> {
+    if let Some(rest) = host.strip_prefix('[') {
+        return rest.split(']').next()?.parse::<Ipv6Addr>().ok().map(IpAddr::V6);
+    }
+    host.split(':').next()?.parse::<Ipv4Addr>().ok().map(IpAddr::V4)
 }
 
 #[cfg(test)]
@@ -245,20 +264,47 @@ mod tests {
         assert_eq!(Insecure::parse("http://registry.lan:5000/").unwrap(), Insecure::Host("registry.lan:5000".into()));
         assert_eq!(Insecure::parse("https://registry.lan").unwrap(), Insecure::Host("registry.lan".into()));
         assert_eq!(Insecure::parse("[fd00::1]:5000").unwrap(), Insecure::Host("[fd00::1]:5000".into()));
+        // One IPv6 address, one spelling.
+        assert_eq!(Insecure::parse("[FD00:0:0::1]:5000").unwrap(), Insecure::Host("[fd00::1]:5000".into()));
         assert_eq!(Insecure::parse("10.1.2.3/8").unwrap().as_string(), "10.0.0.0/8");
         assert_eq!(Insecure::parse("fd00::/8").unwrap().as_string(), "fd00::/8");
+        assert_eq!(Insecure::parse("203.0.113.0/24").unwrap().as_string(), "203.0.113.0/24");
     }
 
     #[test]
     fn everything_and_docker_hub_are_refused() {
-        for bad in ["", " ", "http://", "0.0.0.0/0", "::/0", "docker.io", "index.docker.io", "registry-1.docker.io:443", "reg lan", "reg.lan:port", "reg.lan:0", "10.0.0.0/33", "[nope]:5000", "a..b", "reg.lan/path"] {
+        for bad in [
+            "", " ", "http://", "0.0.0.0/0", "::/0", "docker.io", "index.docker.io", "registry-1.docker.io:443", "registry.hub.docker.com", "reg lan", "reg.lan:port", "reg.lan:0", "10.0.0.0/33", "[nope]:5000", "a..b", "reg.lan/path",
+            // A port is plain digits, 1 to 65535.
+            "reg.lan:+5000", "reg.lan:05000", "reg.lan:65536", "reg.lan:",
+            // A user name in front hides the real host.
+            "10.0.0.1:@registry-1.docker.io", "user@reg.lan",
+        ] {
             assert!(Insecure::parse(bad).is_err(), "{bad:?} should be refused");
+        }
+        let long_label = format!("{}.lan", "a".repeat(64));
+        let long_name = format!("{}lan", "abcdefghi.".repeat(26));
+        assert!(Insecure::parse(&long_label).is_err());
+        assert!(Insecure::parse(&long_name).is_err());
+        assert!(Insecure::parse(&format!("{}.lan", "a".repeat(63))).is_ok());
+    }
+
+    #[test]
+    fn networks_that_take_in_the_internet_are_refused() {
+        // Halves and quarters of everything, which no /0 check catches.
+        for wide in ["0.0.0.0/1", "128.0.0.0/1", "::/1", "8000::/1", "64.0.0.0/2", "8.0.0.0/8", "11.0.0.0/8", "2000::/3", "2001:db8::/32", "172.0.0.0/8"] {
+            assert!(Insecure::parse(wide).is_err(), "{wide}");
+        }
+        // Private and other never-routed ranges, at any width inside them,
+        // and small networks anywhere.
+        for ok in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fd12:3456::/32", "fe80::/10", "203.0.113.0/24", "198.51.0.0/16", "2001:db8:1::/48"] {
+            assert!(Insecure::parse(ok).is_ok(), "{ok}");
         }
     }
 
     #[test]
     fn only_listed_hosts_are_insecure() {
-        let c = cfg(&["registry.lan:5000", "plain.lan"]);
+        let c = cfg(&["registry.lan:5000", "plain.lan", "[fd00::1]:5000"]);
         assert!(c.is_insecure("registry.lan:5000"));
         assert!(c.is_insecure("REGISTRY.lan:5000"));
         // Docker matches the name as written: another port is another registry.
@@ -267,20 +313,37 @@ mod tests {
         assert!(c.is_insecure("plain.lan"));
         assert!(!c.is_insecure("plain.lan:5000"));
         assert!(!c.is_insecure("ghcr.io"));
+        assert!(c.is_insecure("[fd00:0::1]:5000"), "the same address, spelt longer");
         assert!(!RegistryConfig::default().is_insecure("registry.lan:5000"));
     }
 
     #[test]
-    fn a_network_covers_the_addresses_in_it() {
+    fn a_network_covers_registries_named_by_an_address_in_it() {
         let c = cfg(&["192.168.7.0/24", "fd00:1::/32"]);
         assert!(c.is_insecure("192.168.7.20:5000"));
         assert!(c.is_insecure("192.168.7.20"));
         assert!(!c.is_insecure("192.168.8.20:5000"));
         assert!(c.is_insecure("[fd00:1::5]:5000"));
         assert!(!c.is_insecure("[fd00:2::5]:5000"));
-        // A name is looked up: localhost is 127.0.0.1, not in the network.
-        assert!(!c.is_insecure("localhost:5000"));
-        assert!(cfg(&["127.0.0.0/8"]).is_insecure("localhost:5000"));
+        // A name is never looked up for a network, whatever it resolves to:
+        // localhost is 127.0.0.1, and the network does not cover it.
+        let lo = cfg(&["127.0.0.0/8"]);
+        assert!(lo.is_insecure("127.0.0.1:5000"));
+        assert!(!lo.is_insecure("localhost:5000"));
+        assert!(!lo.is_listed_host("127.0.0.1:5000"));
+    }
+
+    #[test]
+    fn what_is_not_a_plain_host_is_never_insecure() {
+        // A user name in front of the real host, as a login server might be
+        // written: neither the address before the `@` nor loopback counts.
+        let c = cfg(&["10.0.0.0/8", "127.0.0.0/8"]);
+        for weird in ["10.0.0.1:@registry-1.docker.io", "10.0.0.1:@ghcr.io", "127.0.0.1:@evil.example", "10.0.0.1:5000/x", "10.0.0.1:5000?x", "10.0.0.1#x"] {
+            assert!(!c.is_insecure(weird), "{weird}");
+            assert!(!c.is_unverified(weird), "{weird}");
+            assert_eq!(c.reach(weird), Reach::Https, "{weird}");
+        }
+        assert!(is_hub("10.0.0.1:@registry-1.docker.io"));
     }
 
     #[test]
@@ -288,10 +351,10 @@ mod tests {
         // 127.0.0.0/8 is where the hub names would resolve with a hosts-file
         // entry; the network must not cover them.
         let c = cfg(&["10.0.0.0/8", "127.0.0.0/8", "192.168.0.0/16"]);
-        for hub in ["docker.io", "index.docker.io", "registry-1.docker.io", "registry-1.docker.io:443", "REGISTRY-1.docker.io"] {
+        for hub in ["docker.io", "index.docker.io", "registry-1.docker.io", "registry-1.docker.io:443", "REGISTRY-1.docker.io", "registry.hub.docker.com"] {
             assert!(!c.is_insecure(hub), "{hub}");
             assert!(!c.is_unverified(hub), "{hub}");
-            assert_eq!(c.reach(hub, false), Reach::Https, "{hub}");
+            assert_eq!(c.reach(hub), Reach::Https, "{hub}");
         }
         assert!(!RegistryConfig::default().is_insecure("10.1.1.1"));
         // A trailing dot names the same host.
@@ -311,16 +374,20 @@ mod tests {
 
     #[test]
     fn each_host_is_reached_its_own_way() {
-        let mut c = cfg(&["registry.lan:5000"]);
-        c.mirrors = vec![Mirror::parse("http://mirror.lan:5000").unwrap(), Mirror::parse("https://mirror.example.com").unwrap()];
-        assert_eq!(c.reach("registry.lan:5000", false), Reach::Insecure);
-        assert_eq!(c.reach("localhost:5000", false), Reach::Insecure);
-        assert_eq!(c.reach("mirror.lan:5000", true), Reach::Http);
-        assert_eq!(c.reach("mirror.example.com", true), Reach::Https);
-        assert_eq!(c.reach("ghcr.io", false), Reach::Https);
-        // Named as a registry (credentials may go with it), an http://
-        // mirror's host is like any other.
-        assert_eq!(c.reach("mirror.lan:5000", false), Reach::Https);
-        assert_eq!(cfg(&[]).reach("mirror.lan:5000", true), Reach::Https);
+        let c = cfg(&["registry.lan:5000"]);
+        assert_eq!(c.reach("registry.lan:5000"), Reach::Insecure);
+        assert_eq!(c.reach("localhost:5000"), Reach::Insecure);
+        assert_eq!(c.reach("mirror.example.com"), Reach::Https);
+        assert_eq!(c.reach("ghcr.io"), Reach::Https);
+    }
+
+    #[test]
+    fn a_plain_http_mirror_is_used_only_on_a_host_that_may_go_unverified() {
+        let mut c = cfg(&["mirror.lan:5000", "10.0.0.0/8"]);
+        c.mirrors = ["http://mirror.lan:5000", "http://other.lan:5000", "http://127.0.0.1:5000", "http://10.1.2.3:5000", "https://mirror.example.com"].iter().map(|m| Mirror::parse(m).unwrap()).collect();
+        let used: Vec<String> = c.usable_mirrors().map(Mirror::as_url).collect();
+        assert_eq!(used, ["http://mirror.lan:5000", "http://127.0.0.1:5000", "http://10.1.2.3:5000", "https://mirror.example.com"]);
+        assert!(!c.mirror_allowed(&Mirror::parse("http://other.lan:5000").unwrap()));
+        assert!(RegistryConfig::default().mirror_allowed(&Mirror::parse("https://other.lan").unwrap()));
     }
 }

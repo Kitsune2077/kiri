@@ -6,6 +6,9 @@
 
 use crate::reference::is_local;
 
+/// The longest path a mirror's address may have: a registry name or two.
+const MAX_PREFIX: usize = 255;
+
 /// One mirror: `host` is a bare `host[:port]`, as `Reference::registry` is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Mirror {
@@ -38,13 +41,11 @@ impl Mirror {
         if authority.as_str().contains('@') {
             return Err(format!("a mirror address has no username or password: {text}"));
         }
-        let host = authority.as_str().to_ascii_lowercase();
-        if crate::config::is_hub(&host) {
+        let written = authority.as_str().to_ascii_lowercase();
+        if crate::config::is_hub(&written) {
             return Err("Docker Hub is not a mirror of itself: it is always reached directly, over verified HTTPS".into());
         }
-        if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || b".-[]:_".contains(&b)) {
-            return Err(format!("not a host name: {host}"));
-        }
+        let host = crate::config::canonical(&written).ok_or_else(|| format!("not a host name: {written}"))?;
         if scheme != "https" && scheme != "http" {
             return Err(format!("a mirror is an http or https address: {text}"));
         }
@@ -55,7 +56,10 @@ impl Mirror {
         let path = uri.path().trim_matches('/');
         let path = if path == "v2" { "" } else { path.strip_suffix("/v2").unwrap_or(path) };
         let path = path.trim_matches('/');
-        if !path.is_empty() && !path.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_/".contains(&b)) {
+        // Path segments a repository could have: no empty, `.` or `..` one,
+        // which would put the request somewhere else on the mirror.
+        let segment = |seg: &str| !seg.is_empty() && seg != "." && seg != ".." && seg.bytes().all(|b| b.is_ascii_alphanumeric() || b".-_".contains(&b));
+        if !path.is_empty() && (path.len() > MAX_PREFIX || !path.split('/').all(segment)) {
             return Err(format!("not a mirror path: {path}"));
         }
         Ok(Mirror { http: scheme == "http", host, prefix: (!path.is_empty()).then(|| path.to_owned()) })
@@ -123,5 +127,20 @@ mod tests {
         for bad in ["", "   ", "https://", "ftp://mirror.example.com", "https://user:pw@mirror.example.com", "https://mirror.example.com/a b", "https://mirror.example.com/?x=1", "https://mirror.example.com/#x"] {
             assert!(Mirror::parse(bad).is_err(), "{bad:?} should be refused");
         }
+    }
+
+    #[test]
+    fn a_mirror_is_a_plain_host_and_a_clean_path() {
+        // The same checks as an insecure host: ports of plain digits, real labels.
+        for bad in ["https://mirror.lan:", "https://mirror.lan:0", "https://mirror.lan:+5000", "https://a..b", "https://mirror.lan:99999"] {
+            assert!(Mirror::parse(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(Mirror::parse(&format!("https://{}.example.com", "a".repeat(64))).is_err());
+        // Paths that step out of the prefix, or say nothing.
+        for bad in ["https://m.example.com/a/../b", "https://m.example.com/..", "https://m.example.com/a//b", "https://m.example.com/./a"] {
+            assert!(Mirror::parse(bad).is_err(), "{bad:?} should be refused");
+        }
+        assert!(Mirror::parse(&format!("https://m.example.com/{}", "a".repeat(256))).is_err());
+        assert_eq!(Mirror::parse("https://[FD00:0::1]:5000").unwrap().host, "[fd00::1]:5000");
     }
 }
