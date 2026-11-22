@@ -972,12 +972,13 @@ impl Client {
         let Some(challenge) = known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
         let url = format!("{}/v2/", self.base(r.api_host()));
         let agent = self.agent_for(&url);
-        let plain_http = is_http(&url);
         std::thread::scope(|s| {
             // Two connections: after the manifests, the config and the first
             // layer are fetched at once.
             let connections: Vec<_> = (0..2).map(|_| s.spawn(|| agent.get(&url).call().map(drain))).collect();
-            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry, plain_http) {
+            // Never answer a plain-HTTP realm speculatively from cached probe
+            // state: plain-HTTP realms wait for an actual plain-HTTP 401.
+            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry, false) {
                 Self::remember_token(key, header, ttl);
             }
             let mut failed = None;
@@ -2970,6 +2971,46 @@ mod tests {
         remember_scheme(plain.clone(), "http", Duration::from_secs(60));
         assert!(c.login(&plain).is_ok(), "plain-HTTP 401 should still be allowed");
         assert!(plain_seen.lock().unwrap().iter().any(|h| h.starts_with("GET /token")));
+    }
+
+    /// `warm_up` never answers a plain-HTTP token realm speculatively from
+    /// cached probe state (where the registry may now redirect to HTTPS or
+    /// serve HTTPS-only); HTTPS realms still prefetch.
+    #[test]
+    fn warm_up_never_answers_a_plain_http_realm_speculatively() {
+        let p_host: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let h1 = p_host.clone();
+        let (plain, plain_seen) = recording_server(move |head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"tok\"}".into()
+            } else {
+                redirect(&format!("https://{}/v2/", h1.get().unwrap()))
+            }
+        });
+        p_host.set(plain.clone()).unwrap();
+        remember_scheme(plain.clone(), "http", Duration::from_secs(60));
+        CHALLENGES.lock().unwrap().insert(plain.clone(), format!(r#"Bearer realm="http://{plain}/token",service="r""#));
+        let c = test_client().with_credentials(me());
+        let r = Reference::parse(&format!("{plain}/team/app:1")).unwrap();
+        c.warm_up(&r, "pull").unwrap();
+        let seen = plain_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(!seen.contains("get /token") && !seen.contains("authorization"), "warm_up sent credentials to plain-HTTP realm: {seen}");
+        assert!(Client::cached_token(&c.token_key(&r, "pull")).is_none());
+
+        // An HTTPS realm still prefetches during warm_up.
+        let (tls, tls_seen) = tls_recording_server(|head| {
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 22\r\nConnection: close\r\n\r\n{\"token\":\"prefetched\"}".into()
+            } else {
+                OK.into()
+            }
+        });
+        remember_scheme(tls.clone(), "https", Duration::from_secs(60));
+        CHALLENGES.lock().unwrap().insert(tls.clone(), format!(r#"Bearer realm="https://{tls}/token",service="r""#));
+        let tls_r = Reference::parse(&format!("{tls}/team/app:1")).unwrap();
+        c.warm_up(&tls_r, "pull").unwrap();
+        assert_eq!(Client::cached_token(&c.token_key(&tls_r, "pull")).as_deref(), Some("Bearer prefetched"));
+        assert!(tls_seen.lock().unwrap().iter().any(|h| h.starts_with("GET /token")));
     }
 
     /// A mirror is asked over the scheme it was written with, unprobed:
