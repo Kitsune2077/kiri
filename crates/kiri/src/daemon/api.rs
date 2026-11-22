@@ -119,17 +119,37 @@ fn status_of(e: Error) -> (u16, String) {
     }
 }
 
+/// Kiri's own endpoints (`/kiri/…`) that change something and that a
+/// container given the engine's socket may still call: starting the VM it
+/// already runs in (`kiri start` in a container's shell). Every other one
+/// that is not a GET (the settings, Stop, Sleep, ports, USB, the builder's
+/// limits, and any added later) is for this machine's programs only, as
+/// Docker's API has nothing that changes the engine's own settings.
+const CONTAINER_MAY: &[(&str, &str)] = &[("POST", "/kiri/wake")];
+
+/// Whether a container's connection may make this request.
+fn container_may(method: &str, path: &str) -> bool {
+    let kiri = path == "/kiri" || path.starts_with("/kiri/");
+    !kiri || matches!(method, "GET" | "HEAD") || CONTAINER_MAY.contains(&(method, path))
+}
+
 fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream, r: &mut BufReader<UnixStream>) -> io::Result<Next> {
     if req.api_version.is_some_and(|v| v < http::MIN_API_VERSION) {
         let (major, minor) = req.api_version.unwrap_or_default();
         let (min_major, min_minor) = http::MIN_API_VERSION;
         return reply(w, Err(Error::BadRequest(format!("client version {major}.{minor} is too old. Minimum supported API version is {min_major}.{min_minor}, please upgrade your client to a newer version"))), 200);
     }
+    let p = req.path.as_str();
+    let m = req.method.as_str();
+    // Kiri's own endpoints that change something are for this machine's
+    // programs (caller.rs), not for a container given the socket.
+    if caller == Caller::Container && !container_may(m, p) {
+        http::error(w, 403, "this is changed in Kiri's window or with the kiri command on this machine, not from a container")?;
+        return Ok(Next::KeepAlive);
+    }
     if let Some(done) = super::ops::route(req, engine, w) {
         return done;
     }
-    let p = req.path.as_str();
-    let m = req.method.as_str();
     match (m, p) {
         ("GET" | "HEAD", "/_ping") => {
             // Builder-Version 1: the classic POST /build, which Kiri serves
@@ -150,16 +170,6 @@ fn route(req: &Request, engine: &Arc<Engine>, caller: Caller, w: &mut UnixStream
         // The window's Stop: off until Start, whatever asks for the VM meanwhile.
         ("POST", "/kiri/stop") => return reply(w, engine.stop_all().map(|()| Value::Null), 204),
         ("POST", "/kiri/sleep") => return reply(w, engine.sleep_now().map(|()| Value::Null), 204),
-        // Settings for this machine's programs only, as Docker has no API
-        // that changes them: not for a container given the socket.
-        ("POST", "/kiri/registries") if caller == Caller::Container => {
-            http::error(w, 403, "the registry settings are changed in Kiri's window or with `kiri registry`, not from a container")?;
-            return Ok(Next::KeepAlive);
-        }
-        ("POST", "/kiri/proxy") | ("PUT", "/kiri/proxy/system") if caller == Caller::Container => {
-            http::error(w, 403, "the proxy settings are changed in Kiri's window, not from a container")?;
-            return Ok(Next::KeepAlive);
-        }
         ("GET", "/kiri/proxy") => return reply(w, Ok(super::proxy::report()), 200),
         ("POST", "/kiri/proxy") => return reply(w, set_proxy(req), 200),
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
@@ -4063,6 +4073,65 @@ mod tests {
         // A close asked for on the second request ends it after that one.
         let (got, ended) = exchange("GET /_ping HTTP/1.1\r\nHost: d\r\n\r\nGET /_ping HTTP/1.1\r\nHost: d\r\nConnection: close\r\n\r\n");
         assert!(ended && got.matches("HTTP/1.1 200 ").count() == 2 && got.matches("Connection: close\r\n").count() == 1, "{got}");
+        drop(engine);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Every one of Kiri's own endpoints that changes something is refused
+    /// on a container's connection, unless listed in `CONTAINER_MAY`; GETs
+    /// stay open. The routes are read from `route` itself, so one added
+    /// later is covered too.
+    #[test]
+    fn a_container_changes_nothing_through_kiris_own_endpoints() {
+        let src = include_str!("api.rs");
+        let body = &src[src.find("\nfn route(").unwrap()..];
+        let body = &body[..body.find("\n}\n").unwrap()];
+        let mut routes: Vec<(String, String)> = Vec::new();
+        for line in body.lines().map(str::trim) {
+            let Some(rest) = line.strip_prefix("(\"") else { continue };
+            let Some((method, rest)) = rest.split_once('"') else { continue };
+            // `("POST", "/kiri/stop")`, or a pattern with `p.strip_prefix("/kiri/…")`.
+            let path = if let Some(lit) = rest.strip_prefix(", \"/kiri") {
+                format!("/kiri{}", lit.split('"').next().unwrap())
+            } else if let Some(i) = rest.find("strip_prefix(\"/kiri/") {
+                let prefix = rest[i + "strip_prefix(\"".len()..].split('"').next().unwrap();
+                let suffix = rest.split("strip_suffix(\"").nth(1).map_or("", |s| s.split('"').next().unwrap());
+                format!("{prefix}1{suffix}")
+            } else {
+                continue;
+            };
+            routes.push((method.to_owned(), path));
+        }
+        for known in [("POST", "/kiri/stop"), ("POST", "/kiri/sleep"), ("POST", "/kiri/registries"), ("PUT", "/kiri/proxy/system"), ("POST", "/kiri/builder"), ("POST", "/kiri/containers/1/ports"), ("DELETE", "/kiri/k8s/forward/1")] {
+            assert!(routes.iter().any(|(m, p)| (m.as_str(), p.as_str()) == known), "{known:?} not found in route(): {routes:?}");
+        }
+        for (m, p) in &routes {
+            let open = m == "GET" || CONTAINER_MAY.contains(&(m.as_str(), p.as_str()));
+            assert_eq!(container_may(m, p), open, "{m} {p}");
+        }
+        assert!(!container_may("PATCH", "/kiri/anything/new"));
+        assert!(!container_may("POST", "/kiri"));
+        assert!(container_may("POST", "/containers/create") && container_may("GET", "/kiri/registries"));
+    }
+
+    /// Through the API itself: a container's Stop and settings are refused,
+    /// and the engine stays as it was.
+    #[test]
+    fn a_containers_stop_and_settings_are_refused() {
+        use std::io::{Read, Write};
+        let (root, engine) = engine_in("container-gate", false);
+        for req in ["POST /v1.47/kiri/stop", "POST /kiri/sleep", "POST /kiri/registries", "POST /kiri/proxy", "POST /kiri/resources", "POST /kiri/domains", "DELETE /kiri/domains"] {
+            let (mut client, server) = UnixStream::pair().unwrap();
+            let served = std::thread::spawn({
+                let engine = engine.clone();
+                move || serve(server, engine, Caller::Container)
+            });
+            client.write_all(format!("{req} HTTP/1.1\r\nHost: d\r\nConnection: close\r\nContent-Length: 2\r\n\r\n{{}}").as_bytes()).unwrap();
+            let mut got = String::new();
+            client.read_to_string(&mut got).unwrap();
+            served.join().unwrap().unwrap();
+            assert!(got.starts_with("HTTP/1.1 403 "), "{req}: {got}");
+        }
         drop(engine);
         let _ = std::fs::remove_dir_all(root);
     }
