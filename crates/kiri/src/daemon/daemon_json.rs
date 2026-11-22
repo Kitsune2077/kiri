@@ -81,6 +81,10 @@ fn read_limited(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
 struct Read {
     stamp: Option<Stamp>,
     config: Arc<RegistryConfig>,
+    /// Every mirror the file lists, in order, those not used included (a
+    /// plain-HTTP one whose host is not listed), so Settings and `kiri
+    /// registry mirror remove` can take one out.
+    listed: Vec<Mirror>,
     problems: Vec<String>,
 }
 
@@ -97,17 +101,17 @@ fn with_current<T>(f: impl FnOnce(&Read) -> T) -> T {
     let stamp = path.as_ref().and_then(|p| std::fs::metadata(p).ok()).map(|m| stamp_of(&m));
     let mut slot = READ.lock().unwrap_or_else(|e| e.into_inner());
     if slot.as_ref().is_none_or(|r| r.stamp != stamp) {
-        let (config, problems) = match (&path, stamp) {
+        let (config, problems, listed) = match (&path, stamp) {
             (Some(p), Some(_)) => match read_limited(p) {
-                Ok(bytes) => parse(&bytes),
-                Err(e) => (RegistryConfig::default(), vec![format!("{} could not be read: {e}", p.display())]),
+                Ok(bytes) => parse_all(&bytes),
+                Err(e) => (RegistryConfig::default(), vec![format!("{} could not be read: {e}", p.display())], Vec::new()),
             },
-            _ => (RegistryConfig::default(), Vec::new()),
+            _ => (RegistryConfig::default(), Vec::new(), Vec::new()),
         };
         for p in &problems {
             crate::diag::warn!("daemon.json", problem = p.as_str());
         }
-        *slot = Some(Read { stamp, config: Arc::new(config), problems });
+        *slot = Some(Read { stamp, config: Arc::new(config), listed, problems });
     }
     f(slot.as_ref().expect("just set"))
 }
@@ -117,11 +121,17 @@ fn with_current<T>(f: impl FnOnce(&Read) -> T) -> T {
 /// daemon keeps running with the entries it could read and says what it
 /// skipped (Settings and `kiri registry` show it).
 fn parse(bytes: &[u8]) -> (RegistryConfig, Vec<String>) {
+    let (config, problems, _) = parse_all(bytes);
+    (config, problems)
+}
+
+/// [`parse`], and every mirror the file lists, the unused ones included.
+fn parse_all(bytes: &[u8]) -> (RegistryConfig, Vec<String>, Vec<Mirror>) {
     let mut problems = Problems::default();
     let v: Value = match serde_json::from_slice(bytes) {
         Ok(v @ Value::Object(_)) => v,
-        Ok(_) => return (RegistryConfig::default(), vec!["daemon.json is not a JSON object".into()]),
-        Err(e) => return (RegistryConfig::default(), vec![format!("daemon.json is not valid JSON: {e}")]),
+        Ok(_) => return (RegistryConfig::default(), vec!["daemon.json is not a JSON object".into()], Vec::new()),
+        Err(e) => return (RegistryConfig::default(), vec![format!("daemon.json is not valid JSON: {e}")], Vec::new()),
     };
     let mut read = |key: &str| strings(&v, key, &mut problems);
     let (insecure, mirrors) = (read(INSECURE), read(MIRRORS));
@@ -142,12 +152,13 @@ fn parse(bytes: &[u8]) -> (RegistryConfig, Vec<String>) {
     }
     let mirrors = capped(parsed.into_iter(), MIRRORS, MAX_MIRRORS, &mut problems);
     let mut config = RegistryConfig { insecure, mirrors };
+    let listed = config.mirrors.clone();
     let (usable, plain): (Vec<Mirror>, Vec<Mirror>) = config.mirrors.iter().cloned().partition(|m| config.mirror_allowed(m));
     for m in plain {
         problems.push(|| format!("{MIRRORS}: {}", plain_mirror(&m)));
     }
     config.mirrors = usable;
-    (config, problems.into_list())
+    (config, problems.into_list(), listed)
 }
 
 /// Why a plain-HTTP mirror is not used.
@@ -241,12 +252,13 @@ fn strings(v: &Value, key: &str, problems: &mut Problems) -> Vec<String> {
 }
 
 /// What Settings and `kiri registry` show: both lists as the file keeps
-/// them, the file's path, and what in it was skipped.
+/// them (a mirror not used among them, so it can be taken out), the file's
+/// path, and what in it was skipped.
 pub fn report() -> Value {
     with_current(|r| {
         json!({
             INSECURE: r.config.insecure.iter().map(Insecure::as_string).collect::<Vec<_>>(),
-            MIRRORS: r.config.mirrors.iter().map(Mirror::as_url).collect::<Vec<_>>(),
+            MIRRORS: r.listed.iter().map(Mirror::as_url).collect::<Vec<_>>(),
             "path": path().map(|p| p.display().to_string()).unwrap_or_default(),
             "problems": r.problems,
         })
@@ -311,6 +323,9 @@ fn save_at(path: &std::path::Path, body: &Value) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Map::new(),
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
+    // The insecure list as it was: a plain-HTTP mirror it did not allow
+    // before (written by hand) does not stop a save that leaves it alone.
+    let was = parse(&serde_json::to_vec(&Value::Object(file.clone())).map_err(|e| e.to_string())?).0;
     let mut given = false;
     if let Some(v) = body.get(INSECURE) {
         file.insert(INSECURE.into(), json!(normalize(v, INSECURE, MAX_INSECURE, |s| Insecure::parse(s).map(|e| e.as_string()))?));
@@ -323,11 +338,14 @@ fn save_at(path: &std::path::Path, body: &Value) -> Result<(), String> {
     if !given {
         return Err(format!("nothing to save: send {INSECURE} or {MIRRORS}"));
     }
-    // A plain-HTTP mirror goes with its host in the insecure list, whichever
-    // of the two lists this save changes.
+    // A plain-HTTP mirror goes with its host in the insecure list: a mirror
+    // list saved must have it, and an insecure list saved may not take a
+    // used mirror's host out. One the file already had unused is said in
+    // the problems, not in the way of an unrelated save.
     let saved = parse(&serde_json::to_vec(&Value::Object(file.clone())).map_err(|e| e.to_string())?).0;
     let listed: Vec<Mirror> = file.get(MIRRORS).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|s| Mirror::parse(s).ok()).collect();
-    if let Some(m) = listed.iter().find(|m| !saved.mirror_allowed(m)) {
+    let mirrors_given = body.get(MIRRORS).is_some();
+    if let Some(m) = listed.iter().find(|m| !saved.mirror_allowed(m) && (mirrors_given || was.mirror_allowed(m))) {
         return Err(format!("{MIRRORS}: {}", plain_mirror(m)));
     }
     if let Some(dir) = path.parent() {
@@ -506,6 +524,29 @@ mod tests {
         save_at(&f, &json!({INSECURE: ["mirror.lan:5000"], MIRRORS: ["http://mirror.lan:5000"]})).unwrap();
         // And the host cannot be taken out of the list while the mirror needs it.
         assert!(save_at(&f, &json!({INSECURE: []})).unwrap_err().contains("plain HTTP"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A plain-HTTP mirror written by hand without its host listed: it is
+    /// not used, it is shown so it can be taken out, and it does not stop
+    /// a save of the insecure list that leaves it alone. Saving the mirror
+    /// list with it still in is refused; without it, it is gone.
+    #[test]
+    fn a_hand_written_plain_http_mirror_does_not_lock_the_lists() {
+        let d = scratch("hand-plain");
+        let f = d.join("daemon.json");
+        std::fs::write(&f, br#"{"registry-mirrors": ["http://mirror.lan:5000", "https://m.example.com"]}"#).unwrap();
+        let (c, problems, listed) = parse_all(&std::fs::read(&f).unwrap());
+        assert_eq!(c.mirrors.iter().map(Mirror::as_url).collect::<Vec<_>>(), ["https://m.example.com"]);
+        assert_eq!(listed.iter().map(Mirror::as_url).collect::<Vec<_>>(), ["http://mirror.lan:5000", "https://m.example.com"], "shown, in order");
+        assert!(problems.iter().any(|p| p.contains("plain HTTP")), "{problems:?}");
+        save_at(&f, &json!({INSECURE: ["other.lan:5000"]})).unwrap();
+        assert!(save_at(&f, &json!({MIRRORS: ["http://mirror.lan:5000", "https://m.example.com"]})).unwrap_err().contains("plain HTTP"));
+        save_at(&f, &json!({MIRRORS: ["https://m.example.com"]})).unwrap();
+        let (c, problems, listed) = parse_all(&std::fs::read(&f).unwrap());
+        assert!(problems.is_empty(), "{problems:?}");
+        assert_eq!(listed, c.mirrors);
+        assert!(c.is_insecure("other.lan:5000"));
         let _ = std::fs::remove_dir_all(&d);
     }
 
