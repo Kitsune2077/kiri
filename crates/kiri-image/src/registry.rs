@@ -462,6 +462,10 @@ fn is_https(url: &str) -> bool {
     url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
 }
 
+fn is_http(url: &str) -> bool {
+    url.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))
+}
+
 /// Whether `s` starts with a URI scheme and `://` (RFC 3986: a letter, then
 /// letters, digits, `+`, `-` or `.`), as `https://host/x` does and
 /// `/blob?next=https://x` does not.
@@ -886,21 +890,20 @@ impl Client {
     }
 
     /// Whether a token `realm` the registry named may be asked: over HTTPS,
-    /// or over plain HTTP only on the insecure registry's own host and port
-    /// (a registry on plain HTTP names its own address for tokens). A realm
-    /// named without a port is on plain HTTP's; a registry named without one
-    /// on the port of the scheme it answered on, and on none while that is
-    /// not known. A registry that answered HTTPS gets no plain-HTTP realm.
-    /// For a registry on this machine its own port on this machine counts as
-    /// its own, however the realm spells loopback (`localhost`, `127.0.0.1`,
-    /// `[::1]`); a name under `.localhost` does not, as a resolver may send
-    /// it to DNS. Never in the clear to another host or port, listed or not,
-    /// and never because of a network entry.
-    fn realm_is_secure(&self, realm: &str, registry: &str) -> bool {
+    /// or over plain HTTP only when the request that got the 401 was itself
+    /// plain HTTP (`plain_http`) and the realm is on the insecure registry's
+    /// own host and port (a registry on plain HTTP names its own address for
+    /// tokens). Fails closed: an HTTPS request (or an unknown scheme) never
+    /// gets a plain-HTTP realm. For a registry on this machine its own port
+    /// on this machine counts as its own, however the realm spells loopback
+    /// (`localhost`, `127.0.0.1`, `[::1]`); a name under `.localhost` does
+    /// not, as a resolver may send it to DNS. Never in the clear to another
+    /// host or port, listed or not, and never because of a network entry.
+    fn realm_is_secure(&self, realm: &str, registry: &str, plain_http: bool) -> bool {
         if is_https(realm) {
             return true;
         }
-        if !realm.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
+        if !plain_http || !is_http(realm) {
             return false;
         }
         let Some(host) = url_host(realm) else { return false };
@@ -911,28 +914,9 @@ impl Client {
             name(&host).is_some_and(|h| Some(h) == name(registry))
         };
         let realm_port = named_port(&host).map(|p| p.unwrap_or(80));
-        let registry_port = named_port(registry).map(|p| p.or_else(|| self.scheme_port(registry)));
-        let same_port = matches!((realm_port, registry_port), (Ok(a), Ok(Some(b))) if a == b);
-        self.config.is_unverified(registry) && !crate::config::is_hub(&host) && same_host && same_port && self.known_scheme(registry) != Some("https")
-    }
-
-    /// The scheme a registry is reached on: HTTPS for a verified one, and
-    /// for one reached either way the one the probe found (never probed
-    /// from here); `None` while that isn't known.
-    fn known_scheme(&self, registry: &str) -> Option<&'static str> {
-        if let Some(scheme) = self.written_scheme(registry) {
-            return Some(scheme);
-        }
-        match self.config.reach(registry) {
-            Reach::Https => Some("https"),
-            Reach::Insecure => remembered_scheme(&crate::config::canonical(registry).unwrap_or_else(|| registry.to_ascii_lowercase())),
-        }
-    }
-
-    /// The port a registry named without one is reached on: 443 over
-    /// HTTPS, 80 over plain HTTP ([`Client::known_scheme`]).
-    fn scheme_port(&self, registry: &str) -> Option<u16> {
-        Some(if self.known_scheme(registry)? == "http" { 80 } else { 443 })
+        let registry_port = named_port(registry).map(|p| p.unwrap_or(80));
+        let same_port = matches!((realm_port, registry_port), (Ok(a), Ok(b)) if a == b);
+        self.config.is_unverified(registry) && !crate::config::is_hub(&host) && same_host && same_port
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -988,11 +972,12 @@ impl Client {
         let Some(challenge) = known.or_else(|| (r.registry == "docker.io").then(|| DOCKER_HUB_CHALLENGE.to_owned())) else { return Ok(()) };
         let url = format!("{}/v2/", self.base(r.api_host()));
         let agent = self.agent_for(&url);
+        let plain_http = is_http(&url);
         std::thread::scope(|s| {
             // Two connections: after the manifests, the config and the first
             // layer are fetched at once.
             let connections: Vec<_> = (0..2).map(|_| s.spawn(|| agent.get(&url).call().map(drain))).collect();
-            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry) {
+            if let Ok((header, ttl)) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry, plain_http) {
                 Self::remember_token(key, header, ttl);
             }
             let mut failed = None;
@@ -1530,11 +1515,13 @@ impl Client {
             // host a redirect or an upload address named) is not the
             // registry asking: its challenge is not answered with the
             // registry's credentials.
-            let own = final_url(&rsp).is_some_and(|u| is_own_origin(&u, &registry_base));
+            let from = final_url(&rsp);
+            let own = from.as_deref().is_some_and(|u| is_own_origin(u, &registry_base));
             if rsp.status().as_u16() == 401 && attempt == 0 && own {
+                let plain_http = from.as_deref().is_some_and(is_http);
                 let challenge = rsp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 drain(rsp);
-                let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry).map_err(|e| match e {
+                let (answer, ttl) = self.answer(&challenge, &format!("repository:{}:{actions}", r.repository), &r.registry, plain_http).map_err(|e| match e {
                     Error::Status { url, status, body } if url.is_empty() => Error::Status { url: self.base(r.api_host()), status, body },
                     e => e,
                 })?;
@@ -1552,7 +1539,7 @@ impl Client {
 
     /// The `Authorization` header that answers a `WWW-Authenticate` challenge
     /// from `registry`, and how long it lasts.
-    fn answer(&self, challenge: &str, default_scope: &str, registry: &str) -> Result<(String, Duration), Error> {
+    fn answer(&self, challenge: &str, default_scope: &str, registry: &str, plain_http: bool) -> Result<(String, Duration), Error> {
         if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
             let basic = self.credentials.as_ref().and_then(Credentials::basic).ok_or_else(|| Error::Status {
                 url: String::new(),
@@ -1563,21 +1550,21 @@ impl Client {
         }
         let params = parse_challenge(challenge);
         let scope = params.get("scope").cloned().unwrap_or_else(|| default_scope.to_owned());
-        let (token, ttl) = self.token(&params, Some(&scope), registry)?;
+        let (token, ttl) = self.token(&params, Some(&scope), registry, plain_http)?;
         Ok((format!("Bearer {token}"), ttl))
     }
 
     /// A bearer token from the challenge's realm, as the logged-in user if
     /// any, and how long it lasts.
-    fn token(&self, params: &HashMap<String, String>, scope: Option<&str>, registry: &str) -> Result<(String, Duration), Error> {
+    fn token(&self, params: &HashMap<String, String>, scope: Option<&str>, registry: &str, plain_http: bool) -> Result<(String, Duration), Error> {
         let realm = params.get("realm").ok_or_else(|| Error::Http("registry sent no token realm".into()))?;
         let service = params.get("service").map(String::as_str).unwrap_or_default();
         // The registry names the realm, so a registry (or whoever answers for
         // it) could send the request anywhere, in the clear: a plain-HTTP
-        // realm is asked only on the registry's own host (see
-        // `realm_is_secure`), and nowhere else at all.
-        if !self.realm_is_secure(realm, registry) {
-            return Err(Error::Http(format!("{registry} named the token service {realm}: plain HTTP to another host is not asked")));
+        // realm is asked only on the registry's own host and port when the
+        // challenge itself arrived over plain HTTP (see `realm_is_secure`).
+        if !self.realm_is_secure(realm, registry, plain_http) {
+            return Err(Error::Http(format!("{registry} named the token service {realm}: plain HTTP is not asked")));
         }
         let creds = self.credentials.as_ref();
         let mut resp = if let Some(c) = creds.filter(|c| !c.identity_token.is_empty()) {
@@ -1715,6 +1702,7 @@ impl Client {
                 Err(Error::Status { url, status: 401, body: "unauthorized: the registry sent the request elsewhere".into() })
             }
             401 => {
+                let plain_http = final_url(&resp).is_some_and(|u| is_http(&u));
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
                     // Where the challenge came from: the registry moved up to
@@ -1725,7 +1713,7 @@ impl Client {
                         status: 401,
                         body: "unauthorized: the registry sent the request elsewhere".into(),
                     })?;
-                    let (auth, _) = self.answer(&challenge, "", host)?;
+                    let (auth, _) = self.answer(&challenge, "", host, plain_http)?;
                     let again = self.get_following(&at, host, Some(&auth), &[], &[])?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
@@ -1733,7 +1721,7 @@ impl Client {
                     };
                 }
                 // A token for no particular repository proves the password.
-                self.token(&parse_challenge(&challenge), None, host).map(|_| ())
+                self.token(&parse_challenge(&challenge), None, host, plain_http).map(|_| ())
             }
             s => Err(Error::Status { url, status: s, body: String::new() }),
         }
@@ -2336,14 +2324,15 @@ mod tests {
     #[test]
     fn credentials_only_use_https_or_a_loopback_realm() {
         let c = Client::new();
-        assert!(c.realm_is_secure("https://auth.example.com/token", "registry.example.com"));
-        assert!(c.realm_is_secure("http://127.0.0.1:5000/token", "localhost:5000"));
-        assert!(c.realm_is_secure("http://[::1]:5000/token", "localhost:5000"));
-        // A registry named without a port: on plain HTTP's port when it
-        // answered plain HTTP, and not while that isn't known.
-        assert!(!c.realm_is_secure("http://localhost/token", "127.0.0.1"));
-        remember_scheme("127.0.0.1".into(), "http", Duration::from_secs(60));
-        assert!(c.realm_is_secure("http://localhost/token", "127.0.0.1"));
+        assert!(c.realm_is_secure("https://auth.example.com/token", "registry.example.com", false));
+        assert!(c.realm_is_secure("https://auth.example.com/token", "registry.example.com", true));
+        assert!(c.realm_is_secure("http://127.0.0.1:5000/token", "localhost:5000", true));
+        assert!(c.realm_is_secure("http://[::1]:5000/token", "localhost:5000", true));
+        assert!(!c.realm_is_secure("http://127.0.0.1:5000/token", "localhost:5000", false), "an HTTPS challenge gets no plain-HTTP realm");
+        // A registry named without a port: on plain HTTP's port when the
+        // challenge arrived over plain HTTP, and never when it arrived over HTTPS.
+        assert!(!c.realm_is_secure("http://localhost/token", "127.0.0.1", false));
+        assert!(c.realm_is_secure("http://localhost/token", "127.0.0.1", true));
         for (realm, registry) in [
             ("http://auth.example.com/token", "registry.example.com"),
             ("http://auth.example.com/token", "localhost:5000"),
@@ -2362,24 +2351,24 @@ mod tests {
             ("http://127.0.0.1:0/token", "localhost:0"),
             ("http://localhost:/token", "localhost:x"),
         ] {
-            assert!(!c.realm_is_secure(realm, registry), "{realm} for {registry}");
+            assert!(!c.realm_is_secure(realm, registry, true), "{realm} for {registry}");
+            assert!(!c.realm_is_secure(realm, registry, false), "{realm} for {registry}");
         }
-        // A registry on this machine that answered HTTPS (on 443) does not
-        // own plain HTTP's port 80 there.
-        remember_scheme("[::1]".into(), "https", Duration::from_secs(60));
-        assert!(!c.realm_is_secure("http://[::1]/token", "[::1]"));
-        assert!(!c.realm_is_secure("http://127.0.0.1/token", "[::1]"));
-        assert!(!c.realm_is_secure("http://127.0.0.1:443/token", "[::1]"), "a registry that answered HTTPS gets no plain-HTTP realm");
+        // A registry on this machine that answered HTTPS (on 443) gets no
+        // plain-HTTP realm.
+        assert!(!c.realm_is_secure("http://[::1]/token", "[::1]", false));
+        assert!(!c.realm_is_secure("http://127.0.0.1/token", "[::1]", false));
+        assert!(!c.realm_is_secure("http://127.0.0.1:443/token", "[::1]", false), "a registry that answered HTTPS gets no plain-HTTP realm");
         assert_eq!((named_port("h:5000"), named_port("h"), named_port("[::1]"), named_port("[::1]:80")), (Ok(Some(5000)), Ok(None), Ok(None), Ok(Some(80))));
         assert_eq!((named_port("h:"), named_port("h:0"), named_port("h:70000"), named_port("h:x")), (Err(()), Err(()), Err(()), Err(())));
         // A plain-HTTP realm gets them only when insecure-registries lists
         // its host (a registry on plain HTTP names its own address).
-        remember_scheme("registry.lan".into(), "http", Duration::from_secs(60));
         let listed = Client::new().with_config(RegistryConfig { insecure: vec![crate::config::Insecure::parse("registry.lan").unwrap()], ..Default::default() });
-        assert!(listed.realm_is_secure("http://registry.lan/service/token", "registry.lan"));
-        assert!(!listed.realm_is_secure("http://auth.example.com/token", "registry.lan"));
-        assert!(!listed.realm_is_secure("http://registry.lan:8080/service/token", "registry.lan"));
-        assert!(!c.realm_is_secure("http://registry.lan/service/token", "registry.lan"));
+        assert!(listed.realm_is_secure("http://registry.lan/service/token", "registry.lan", true));
+        assert!(!listed.realm_is_secure("http://registry.lan/service/token", "registry.lan", false));
+        assert!(!listed.realm_is_secure("http://auth.example.com/token", "registry.lan", true));
+        assert!(!listed.realm_is_secure("http://registry.lan:8080/service/token", "registry.lan", true));
+        assert!(!c.realm_is_secure("http://registry.lan/service/token", "registry.lan", true));
     }
 
     /// A registry on loopback serving one blob: `answer` gets each request's
@@ -2888,28 +2877,99 @@ mod tests {
 
     /// A listed registry named without a port, off this machine, is held
     /// to the same port rule as one on it: a plain-HTTP realm on port 80 is
-    /// its own only when it answered plain HTTP there, never once it
-    /// answered HTTPS (on 443) or before its scheme is known.
+    /// its own only when the challenge arrived over plain HTTP, never after
+    /// an HTTPS challenge.
     #[test]
     fn a_listed_registrys_plain_http_realm_is_on_its_own_port() {
         let listed = |e: &[&str]| test_client().with_config(RegistryConfig { insecure: e.iter().map(|e| crate::config::Insecure::parse(e).unwrap()).collect(), mirrors: Vec::new() });
-        let c = listed(&["realm-unknown.lan", "realm-https.lan", "realm-http.lan", "realm-port.lan:5000"]);
-        assert!(!c.realm_is_secure("http://realm-unknown.lan/token", "realm-unknown.lan"), "scheme not known yet");
-        remember_scheme("realm-https.lan".into(), "https", Duration::from_secs(60));
-        assert!(!c.realm_is_secure("http://realm-https.lan/token", "realm-https.lan"));
-        assert!(!c.realm_is_secure("http://realm-https.lan:443/token", "realm-https.lan"));
-        remember_scheme("realm-http.lan".into(), "http", Duration::from_secs(60));
-        assert!(c.realm_is_secure("http://realm-http.lan/token", "realm-http.lan"));
-        assert!(c.realm_is_secure("http://realm-http.lan:80/token", "realm-http.lan"));
-        assert!(!c.realm_is_secure("http://realm-http.lan:8080/token", "realm-http.lan"));
-        assert!(c.realm_is_secure("http://realm-port.lan:5000/token", "realm-port.lan:5000"));
-        assert!(!c.realm_is_secure("http://realm-port.lan/token", "realm-port.lan:5000"));
-        assert!(!c.realm_is_secure("http://realm-port.lan:5001/token", "realm-port.lan:5000"));
+        let c = listed(&["realm-https.lan", "realm-http.lan", "realm-port.lan:5000"]);
+        assert!(!c.realm_is_secure("http://realm-https.lan/token", "realm-https.lan", false));
+        assert!(!c.realm_is_secure("http://realm-https.lan:443/token", "realm-https.lan", false));
+        assert!(c.realm_is_secure("http://realm-http.lan/token", "realm-http.lan", true));
+        assert!(c.realm_is_secure("http://realm-http.lan:80/token", "realm-http.lan", true));
+        assert!(!c.realm_is_secure("http://realm-http.lan:8080/token", "realm-http.lan", true));
+        assert!(c.realm_is_secure("http://realm-port.lan:5000/token", "realm-port.lan:5000", true));
+        assert!(!c.realm_is_secure("http://realm-port.lan:5000/token", "realm-port.lan:5000", false));
+        assert!(!c.realm_is_secure("http://realm-port.lan/token", "realm-port.lan:5000", true));
+        assert!(!c.realm_is_secure("http://realm-port.lan:5001/token", "realm-port.lan:5000", true));
         // A network entry, named by address: the same rule.
         let net = listed(&["10.0.0.0/8"]);
-        remember_scheme("10.9.8.7".into(), "https", Duration::from_secs(60));
-        assert!(!net.realm_is_secure("http://10.9.8.7/token", "10.9.8.7"));
+        assert!(!net.realm_is_secure("http://10.9.8.7/token", "10.9.8.7", false));
         assert_eq!((without_port("[::1]:80"), without_port("[::1]"), without_port("h.lan:5000"), without_port("h.lan")), ("[::1]", "[::1]", "h.lan", "h.lan"));
+    }
+
+    /// A plain-HTTP token realm is allowed only when the request that got
+    /// the 401 was itself plain HTTP: an HTTPS 401 on an explicit port
+    /// refuses a plain-HTTP realm even if the probe cache entry has expired,
+    /// an HTTP request upgraded to HTTPS before the 401 refuses it too, and
+    /// a genuine plain-HTTP 401 still works when the cache entry is gone.
+    #[test]
+    fn a_plain_http_realm_requires_a_plain_http_challenge() {
+        // 1. Self-signed HTTPS registry on an explicit port: cache expires
+        // before the 401 arrives during login and during pull (authed).
+        let at_host: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let h1 = at_host.clone();
+        let (host, seen) = dual_recording_server(move |scheme, head| {
+            let host = h1.get().unwrap();
+            if scheme == "https" && head.starts_with("GET /v2/") {
+                SCHEMES.lock().unwrap().remove(host);
+                format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{host}/token\",service=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"tok\"}".into()
+            }
+        });
+        at_host.set(host.clone()).unwrap();
+        let c = test_client().with_credentials(me());
+        remember_scheme(host.clone(), "https", Duration::from_secs(60));
+        assert!(c.login(&host).is_err(), "HTTPS login 401 must refuse a plain-HTTP realm");
+        let root = std::env::temp_dir().join(format!("kiri-realm-https-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        remember_scheme(host.clone(), "https", Duration::from_secs(60));
+        let r = Reference::parse(&format!("{host}/team/app:1")).unwrap();
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        assert!(c.pull(&store, &r, &platform, &|_| {}).is_err(), "HTTPS pull 401 must refuse a plain-HTTP realm");
+        let _ = std::fs::remove_dir_all(&root);
+        let plain_reqs: Vec<_> = seen.lock().unwrap().iter().filter(|(s, _)| *s == "http").cloned().collect();
+        assert!(plain_reqs.is_empty(), "sent credentials to plain-HTTP realm after HTTPS 401: {plain_reqs:?}");
+
+        // 2. Plain HTTP upgraded to HTTPS before the 401: the 401 arrived
+        // over HTTPS, so a plain-HTTP realm is refused even while the probe
+        // cache still says http.
+        let up_host: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let h2 = up_host.clone();
+        let (up, up_seen) = dual_recording_server(move |scheme, head| {
+            let host = h2.get().unwrap();
+            if scheme == "http" && head.starts_with("GET /v2/") {
+                redirect(&format!("https://{host}/v2/"))
+            } else if scheme == "https" && head.starts_with("GET /v2/") {
+                format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{host}/token\",service=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            } else {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"tok\"}".into()
+            }
+        });
+        up_host.set(up.clone()).unwrap();
+        remember_scheme(up.clone(), "http", Duration::from_secs(60));
+        assert!(c.login(&up).is_err(), "HTTP->HTTPS upgraded 401 must refuse a plain-HTTP realm");
+        assert!(!up_seen.lock().unwrap().iter().any(|(_, h)| h.starts_with("GET /token")), "asked /token after upgrade: {:?}", up_seen.lock().unwrap());
+
+        // 3. Genuine plain-HTTP 401: still works when the probe cache expires
+        // before the 401 arrives.
+        let p_host: Arc<std::sync::OnceLock<String>> = Arc::default();
+        let h3 = p_host.clone();
+        let (plain, plain_seen) = recording_server(move |head| {
+            let host = h3.get().unwrap();
+            if head.starts_with("GET /token") {
+                "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"tok\"}".into()
+            } else {
+                SCHEMES.lock().unwrap().remove(host);
+                format!("HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Bearer realm=\"http://{host}/token\",service=\"r\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            }
+        });
+        p_host.set(plain.clone()).unwrap();
+        remember_scheme(plain.clone(), "http", Duration::from_secs(60));
+        assert!(c.login(&plain).is_ok(), "plain-HTTP 401 should still be allowed");
+        assert!(plain_seen.lock().unwrap().iter().any(|h| h.starts_with("GET /token")));
     }
 
     /// A mirror is asked over the scheme it was written with, unprobed:
@@ -2939,7 +2999,7 @@ mod tests {
             assert_eq!(carried, Some(scheme));
             let m = c.for_mirror(&target, carried);
             assert_eq!(m.base(&target.registry), format!("{scheme}://{host}"), "{written}");
-            assert_eq!(m.known_scheme(&target.registry), Some(scheme));
+            assert_eq!(m.written_scheme(&target.registry), Some(scheme));
             assert!(m.credentials.is_none() && !m.use_mirrors);
         }
         assert_eq!(conns.load(Ordering::SeqCst), 0, "no probe");
@@ -3070,7 +3130,7 @@ mod tests {
     fn an_unlisted_registry_cannot_send_credentials_to_a_listed_realm() {
         let c = listing(&["auth.lan", "10.0.0.0/8"]);
         for realm in ["http://auth.lan/token", "http://10.1.2.3/token", "http://127.0.0.1:5000/token"] {
-            assert!(!c.realm_is_secure(realm, "registry.example.com"), "{realm}");
+            assert!(!c.realm_is_secure(realm, "registry.example.com", true), "{realm}");
         }
         for realm in ["https://auth.lan/token", "https://10.1.2.3/token"] {
             assert!(!c.agent_for_hop(realm, "registry.example.com").config().tls_config().disable_verification(), "{realm}");
@@ -3078,19 +3138,19 @@ mod tests {
         // A listed registry: itself and listed hosts, but not a host only a
         // network covers.
         let c = listing(&["registry.lan", "auth.lan", "10.0.0.0/8"]);
-        remember_scheme("registry.lan".into(), "http", Duration::from_secs(60));
-        assert!(c.realm_is_secure("http://registry.lan/token", "registry.lan"));
+        assert!(c.realm_is_secure("http://registry.lan/token", "registry.lan", true));
+        assert!(!c.realm_is_secure("http://registry.lan/token", "registry.lan", false));
         // Another listed host is still another host: no plain-HTTP realm there.
-        assert!(!c.realm_is_secure("http://auth.lan/token", "registry.lan"));
-        assert!(!c.realm_is_secure("http://registry.lan:5001/token", "registry.lan"));
-        assert!(!c.realm_is_secure("http://10.1.2.3/token", "registry.lan"));
+        assert!(!c.realm_is_secure("http://auth.lan/token", "registry.lan", true));
+        assert!(!c.realm_is_secure("http://registry.lan:5001/token", "registry.lan", true));
+        assert!(!c.realm_is_secure("http://10.1.2.3/token", "registry.lan", true));
         assert!(c.agent_for_hop("https://auth.lan/token", "registry.lan").config().tls_config().disable_verification());
         assert!(!c.agent_for_hop("https://10.1.2.3/token", "registry.lan").config().tls_config().disable_verification());
-        // A registry the network covers may name itself, once it answered
-        // plain HTTP.
-        remember_scheme("10.1.2.4".into(), "http", Duration::from_secs(60));
-        assert!(c.realm_is_secure("http://10.1.2.4/token", "10.1.2.4"));
-        assert!(!c.realm_is_secure("http://10.1.2.5/token", "10.1.2.4"));
+        // A registry the network covers may name itself, when the challenge
+        // arrived over plain HTTP.
+        assert!(c.realm_is_secure("http://10.1.2.4/token", "10.1.2.4", true));
+        assert!(!c.realm_is_secure("http://10.1.2.4/token", "10.1.2.4", false));
+        assert!(!c.realm_is_secure("http://10.1.2.5/token", "10.1.2.4", true));
     }
 
     /// The same, end to end: the token service is a plain-HTTP server in a
@@ -3102,7 +3162,7 @@ mod tests {
         for creds in [me(), None] {
             let c = listing(&["127.0.0.0/8"]).with_credentials(creds);
             let params = HashMap::from([("realm".to_owned(), format!("http://{realm_host}/token")), ("service".to_owned(), "r".to_owned())]);
-            assert!(c.token(&params, Some("repository:a:pull"), "registry.example.com").is_err());
+            assert!(c.token(&params, Some("repository:a:pull"), "registry.example.com", true).is_err());
         }
         assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
     }
@@ -3115,7 +3175,7 @@ mod tests {
         let realm_host = realm_host.replace("127.0.0.1", "0.0.0.0");
         let c = listing(&["registry.lan:5000", &realm_host]).with_credentials(me());
         let params = HashMap::from([("realm".to_owned(), format!("http://{realm_host}/token")), ("service".to_owned(), "r".to_owned())]);
-        assert!(c.token(&params, Some("repository:a:pull"), "registry.lan:5000").is_err());
+        assert!(c.token(&params, Some("repository:a:pull"), "registry.lan:5000", true).is_err());
         assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
     }
 
@@ -3314,7 +3374,7 @@ mod tests {
         let (a, a_seen) = tls_recording_server(move |_| redirect(&target));
         let c = listing(&[]).with_credentials(Some(Credentials { username: "me".into(), password: "secret".into(), ..Default::default() }));
         let params = HashMap::from([("realm".to_owned(), format!("https://{a}/token")), ("service".to_owned(), "r".to_owned())]);
-        let (token, _) = c.token(&params, Some("repository:a:pull"), &a).unwrap();
+        let (token, _) = c.token(&params, Some("repository:a:pull"), &a, false).unwrap();
         assert_eq!(token, "t");
         assert_eq!(a_seen.lock().unwrap().len(), 1);
         let first = a_seen.lock().unwrap()[0].to_ascii_lowercase();
