@@ -1308,7 +1308,8 @@ impl Engine {
         // The engine's API, for containers that mount /var/run/docker.sock
         // (a Linux host's containers mount the daemon's socket itself).
         if cfg!(target_os = "macos") {
-            vm.listen(super::ports::ENGINE_API_PORT, Box::new(super::ports::serve_engine_api))?;
+            let engine = self.me.get().cloned().unwrap_or_default();
+            vm.listen(super::ports::ENGINE_API_PORT, Box::new(move |s| super::ports::serve_engine_api(s, engine.clone())))?;
         }
         // Container lookups the VM's gateway resolver fails, asked of the
         // Mac's own (VM only: a Linux host's agent asks the host's itself).

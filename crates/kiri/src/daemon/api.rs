@@ -153,6 +153,12 @@ fn route(req: &Request, engine: &Arc<Engine>, w: &mut UnixStream, r: &mut BufRea
         ("PUT", "/kiri/proxy/system") => return reply(w, set_host_proxy(req), 200),
         // daemon.json's registry keys: Settings → Registries, `kiri registry`.
         ("GET", "/kiri/registries") => return reply(w, Ok(super::daemon_json::report()), 200),
+        // Settings for this machine's programs only, as Docker has no API
+        // that changes daemon.json: not for a container given the socket.
+        ("POST", "/kiri/registries") if super::caller::is_container(w) => {
+            http::error(w, 403, "the registry settings are changed in Kiri's window or with `kiri registry`, not from a container")?;
+            return Ok(Next::KeepAlive);
+        }
         ("POST", "/kiri/registries") => return reply(w, set_registries(req, engine), 200),
         ("GET", "/kiri/resources") => return reply(w, Ok(resources(engine)), 200),
         // Settings → Domains: the container-domain routers' ports.

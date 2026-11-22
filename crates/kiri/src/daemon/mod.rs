@@ -7,6 +7,7 @@ pub mod access;
 mod api;
 mod binds;
 mod builder;
+mod caller;
 mod daemon_json;
 pub mod dns;
 pub mod tls;
