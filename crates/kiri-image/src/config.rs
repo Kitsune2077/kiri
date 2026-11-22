@@ -410,6 +410,9 @@ mod tests {
         let c = cfg(&["registry.lan:5000"]);
         assert_eq!(c.reach("registry.lan:5000"), Reach::Insecure);
         assert_eq!(c.reach("localhost:5000"), Reach::Insecure);
+        // A name under .localhost may be sent to DNS: it is not this machine.
+        assert_eq!(c.reach("evil.localhost:5000"), Reach::Https);
+        assert!(!c.mirror_allowed(&Mirror::parse("http://evil.localhost:5000").unwrap()));
         assert_eq!(c.reach("mirror.example.com"), Reach::Https);
         assert_eq!(c.reach("ghcr.io"), Reach::Https);
     }

@@ -119,10 +119,13 @@ impl Reference {
     }
 }
 
-/// `localhost:5000`, `127.0.0.1:5000`, `[::1]:5000`, `registry.localhost`.
+/// `localhost:5000`, `127.0.0.1:5000`, `[::1]:5000`: this machine by address
+/// or as `localhost` itself, which resolves here without asking a name
+/// server, as Docker's loopback set has it. A name under `.localhost` is not:
+/// a resolver may send it to DNS.
 pub fn is_local(host: &str) -> bool {
     let name = if host.starts_with('[') { host.split(']').next().unwrap_or(host).trim_start_matches('[') } else { host.split(':').next().unwrap_or(host) };
-    name == "localhost" || name.ends_with(".localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 impl fmt::Display for Reference {
@@ -204,10 +207,10 @@ mod tests {
 
     #[test]
     fn only_real_loopback_registries_are_local() {
-        for host in ["localhost", "localhost:5000", "registry.localhost", "127.0.0.1", "127.1.2.3:5000", "[::1]:5000"] {
+        for host in ["localhost", "localhost:5000", "LocalHost:5000", "127.0.0.1", "127.1.2.3:5000", "[::1]:5000"] {
             assert!(is_local(host), "{host}");
         }
-        for host in ["127.evil.com", "127.0.0.1.evil.com", "example.com", "[::2]:5000"] {
+        for host in ["127.evil.com", "127.0.0.1.evil.com", "example.com", "[::2]:5000", "registry.localhost", "evil.localhost:5000"] {
             assert!(!is_local(host), "{host}");
         }
         assert_eq!(Reference::parse("127.evil.com/owner/image").unwrap().api_base(), "https://127.evil.com");

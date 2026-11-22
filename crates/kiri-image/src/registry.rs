@@ -445,12 +445,6 @@ fn named_port(host: &str) -> Result<Option<u16>, ()> {
     }
 }
 
-/// Whether a `host[:port]` is this machine by address or as `localhost`
-/// itself, which resolve here without asking a name server.
-fn is_loopback(host: &str) -> bool {
-    let name = if host.starts_with('[') { host.split(']').next().unwrap_or(host).trim_start_matches('[') } else { host.split(':').next().unwrap_or(host) };
-    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
-}
 
 fn is_https(url: &str) -> bool {
     url.get(..8).is_some_and(|s| s.eq_ignore_ascii_case("https://"))
@@ -877,10 +871,10 @@ impl Client {
         // spells loopback. A realm named without a port is on plain HTTP's;
         // a registry named without one on the port of the scheme it
         // answered on.
-        let own = if is_loopback(&host) {
+        let own = if crate::reference::is_local(&host) {
             let realm_port = named_port(&host).map(|p| p.unwrap_or(80));
             let registry_port = named_port(registry).map(|p| p.or_else(|| self.scheme_port(registry)));
-            is_loopback(registry) && matches!((realm_port, registry_port), (Ok(a), Ok(Some(b))) if a == b)
+            crate::reference::is_local(registry) && matches!((realm_port, registry_port), (Ok(a), Ok(Some(b))) if a == b)
         } else {
             same
         };
@@ -2309,6 +2303,7 @@ mod tests {
             // A .localhost registry is not this machine either.
             ("http://127.0.0.1:5000/token", "evil.localhost:5000"),
             ("http://localhost:5000/token", "evil.localhost:5000"),
+            ("http://evil.localhost:5000/token", "evil.localhost:5000"),
             // A port that is not one matches nothing, not even another.
             ("http://127.0.0.1:0/token", "localhost:0"),
             ("http://localhost:/token", "localhost:x"),
@@ -2812,6 +2807,18 @@ mod tests {
         assert!(!Client::new().agent_for("https://registry.lan:5000/v2/").config().tls_config().disable_verification());
         // And the insecure agent leaves redirects to send_get.
         assert_eq!(c.agent_for("https://registry.lan:5000/v2/").config().max_redirects(), 0);
+    }
+
+    /// Where a registry's own requests may go unverified: a name under
+    /// `.localhost` is not this machine, so a registry on this machine does
+    /// not send them there, and one so named is not insecure at all.
+    #[test]
+    fn a_dot_localhost_name_is_not_this_machine_for_hops() {
+        let c = test_client();
+        assert!(c.unverified_ok("127.0.0.1:5000", "localhost:5000"));
+        assert!(!c.unverified_ok("evil.localhost:5000", "localhost:5000"));
+        assert!(!c.unverified_ok("localhost:5000", "evil.localhost:5000"));
+        assert!(!c.unverified_ok("evil.localhost:5000", "evil.localhost:5000"));
     }
 
     #[test]
