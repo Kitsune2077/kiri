@@ -771,11 +771,11 @@ impl Client {
         }
     }
 
-    /// Whether credentials may go to a token `realm` the registry named:
-    /// over HTTPS, or over plain HTTP to a realm of an insecure registry
-    /// that is the registry's own host or a host written in the list (a
-    /// registry on plain HTTP names its own address for tokens). Never in
-    /// the clear to anywhere else, and never because of a network entry.
+    /// Whether a token `realm` the registry named may be asked: over HTTPS,
+    /// or over plain HTTP only on the insecure registry's own host and port
+    /// (a registry on plain HTTP names its own address for tokens), or on
+    /// this machine for a registry on this machine. Never in the clear to
+    /// another host, listed or not, and never because of a network entry.
     fn realm_is_secure(&self, realm: &str, registry: &str) -> bool {
         if is_https(realm) {
             return true;
@@ -783,7 +783,10 @@ impl Client {
         if !realm.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")) {
             return false;
         }
-        url_host(realm).is_some_and(|host| self.unverified_ok(&host, registry))
+        let Some(host) = url_host(realm) else { return false };
+        let same = crate::config::canonical(&host).is_some_and(|h| Some(h) == crate::config::canonical(registry));
+        let local = crate::reference::is_local(&host) && crate::reference::is_local(registry);
+        self.config.is_unverified(registry) && !crate::config::is_hub(&host) && (same || local)
     }
 
     /// Who the tokens are for: a fingerprint of the credentials, so one
@@ -1369,14 +1372,13 @@ impl Client {
         let realm = params.get("realm").ok_or_else(|| Error::Http("registry sent no token realm".into()))?;
         let service = params.get("service").map(String::as_str).unwrap_or_default();
         // The registry names the realm, so a registry (or whoever answers for
-        // it) could send the credentials anywhere, in the clear: only an https
-        // realm gets them, or a loopback realm for a loopback registry.
-        let secure = self.realm_is_secure(realm, registry);
-        if !secure && self.credentials.is_some() {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| eprintln!("kiri: not sending {registry}'s credentials to its token realm {realm}: not https"));
+        // it) could send the request anywhere, in the clear: a plain-HTTP
+        // realm is asked only on the registry's own host (see
+        // `realm_is_secure`), and nowhere else at all.
+        if !self.realm_is_secure(realm, registry) {
+            return Err(Error::Http(format!("{registry} named the token service {realm}: plain HTTP to another host is not asked")));
         }
-        let creds = self.credentials.as_ref().filter(|_| secure);
+        let creds = self.credentials.as_ref();
         let mut resp = if let Some(c) = creds.filter(|c| !c.identity_token.is_empty()) {
             // An identity token is an OAuth refresh token.
             let mut form = vec![("grant_type", "refresh_token"), ("refresh_token", c.identity_token.as_str()), ("service", service), ("client_id", "kiri")];
@@ -2585,7 +2587,9 @@ mod tests {
         // network covers.
         let c = listing(&["registry.lan", "auth.lan", "10.0.0.0/8"]);
         assert!(c.realm_is_secure("http://registry.lan/token", "registry.lan"));
-        assert!(c.realm_is_secure("http://auth.lan/token", "registry.lan"));
+        // Another listed host is still another host: no plain-HTTP realm there.
+        assert!(!c.realm_is_secure("http://auth.lan/token", "registry.lan"));
+        assert!(!c.realm_is_secure("http://registry.lan:5001/token", "registry.lan"));
         assert!(!c.realm_is_secure("http://10.1.2.3/token", "registry.lan"));
         assert!(c.agent_for_hop("https://auth.lan/token", "registry.lan").config().tls_config().disable_verification());
         assert!(!c.agent_for_hop("https://10.1.2.3/token", "registry.lan").config().tls_config().disable_verification());
@@ -2594,19 +2598,54 @@ mod tests {
         assert!(!c.realm_is_secure("http://10.1.2.5/token", "10.1.2.4"));
     }
 
-    /// The same, end to end: the token service is a plain-HTTP server a
-    /// listed host, and the registry that names it is not listed.
+    /// The same, end to end: the token service is a plain-HTTP server in a
+    /// listed network, and the registry that names it is not listed: it is
+    /// not asked at all, with credentials or without.
     #[test]
-    fn an_unlisted_registrys_token_request_carries_no_credentials() {
+    fn an_unlisted_registrys_plain_http_realm_is_not_asked() {
         let (realm_host, seen) = recording_server(|_| "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into());
-        let c = listing(&["127.0.0.0/8"]).with_credentials(Some(Credentials { username: "me".into(), password: "secret".into(), ..Default::default() }));
+        for creds in [me(), None] {
+            let c = listing(&["127.0.0.0/8"]).with_credentials(creds);
+            let params = HashMap::from([("realm".to_owned(), format!("http://{realm_host}/token")), ("service".to_owned(), "r".to_owned())]);
+            assert!(c.token(&params, Some("repository:a:pull"), "registry.example.com").is_err());
+        }
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    }
+
+    /// A listed registry names another listed host's plain-HTTP address as
+    /// its token service: the credentials do not travel there.
+    #[test]
+    fn a_plain_http_realm_on_another_listed_host_gets_nothing() {
+        let (realm_host, seen) = recording_server(|_| "HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"token\":\"t\"}  ".into());
+        let realm_host = realm_host.replace("127.0.0.1", "0.0.0.0");
+        let c = listing(&["registry.lan:5000", &realm_host]).with_credentials(me());
         let params = HashMap::from([("realm".to_owned(), format!("http://{realm_host}/token")), ("service".to_owned(), "r".to_owned())]);
-        let (token, _) = c.token(&params, Some("repository:a:pull"), "registry.example.com").unwrap();
-        assert_eq!(token, "t");
-        let heads = seen.lock().unwrap().join("\n").to_ascii_lowercase();
-        assert!(heads.contains("get /token"), "{heads}");
-        assert!(!heads.contains("authorization"), "{heads}");
-        assert!(!heads.contains("account=me"), "{heads}");
+        assert!(c.token(&params, Some("repository:a:pull"), "registry.lan:5000").is_err());
+        assert!(seen.lock().unwrap().is_empty(), "{:?}", seen.lock().unwrap());
+    }
+
+    /// No agent follows a redirect itself, so a registry over verified
+    /// HTTPS cannot send a request on to plain HTTP: every hop goes through
+    /// `hop`, which refuses it.
+    #[test]
+    fn a_verified_registry_cannot_redirect_to_plain_http() {
+        assert_eq!(shared_agent().config().max_redirects(), 0);
+        assert_eq!(insecure_agent().config().max_redirects(), 0);
+        let (plain, plain_seen) = recording_server(|_| OK.into());
+        let target = format!("http://{plain}/stolen");
+        let (https, _) = tls_recording_server(move |_| redirect(&target));
+        // 0.0.0.0 reaches the server without being loopback: a registry
+        // elsewhere, which nothing lists. The agent here skips the
+        // certificate check only so the test server can answer; the client
+        // treats the host as verified.
+        let https = https.replace("127.0.0.1", "0.0.0.0");
+        let cfg = ureq::Agent::config_builder().http_status_as_error(false).max_redirects(0).tls_config(crate::connect::unverified_tls_config()).build();
+        let agent = ureq::Agent::with_parts(cfg, crate::connect::connector(), ureq::unversioned::resolver::DefaultResolver::default());
+        let c = Client { agent, credentials: None, config: Default::default(), use_mirrors: true };
+        assert!(!c.config.is_unverified(&https));
+        let got = c.send_get(&format!("https://{https}/v2/x"), Some("Basic c2VjcmV0"), &[]);
+        assert!(got.is_err(), "followed down to plain HTTP: {:?}", got.map(|r| r.status()));
+        assert!(plain_seen.lock().unwrap().is_empty());
     }
 
     /// A server on loopback that records each request's head and answers it
