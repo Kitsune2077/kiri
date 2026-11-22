@@ -69,9 +69,18 @@ Apple silicon and Intel Macs (macOS 14+), Windows 10 and 11 (x86-64 and Arm, thr
   hands the pull to the next mirror and then Docker Hub, and an image a
   mirror served records which; a plain-HTTP token service is asked only
   on the registry's own host and port; and no redirect goes from HTTPS down to
-  plain HTTP except to a listed host. The lists are changed from this
-  machine only (the window, `kiri registry` or the file), never from a
-  container given the engine's socket. A daemon.json larger than
+  plain HTTP except to a listed host. BuildKit's settings name hosts, not
+  networks, so a network reaches `docker build` for a registry once an
+  image from it has been pulled (until then such a `FROM` fails rather
+  than going unchecked): pull from a new registry in a listed network once,
+  or list it by name. The lists, like Kiri's other settings, are changed
+  from this machine (the window, `kiri registry` or the file). Containers
+  can't change Kiri's settings through the engine's API, even with its
+  socket. As with Docker, a container you give writable host folders can
+  change your files there, Kiri's settings among them, and a container
+  that can create containers with `--privileged`, `--pid=host`,
+  `SYS_ADMIN`, `--device` or a mount of the host's root is as good as root
+  on this machine. A daemon.json larger than
   256 KiB, or not a regular file, is ignored, and at most 256 hosts and
   16 mirrors are read. Settings → Registries and `kiri registry
   insecure|mirror add|remove` edit the same file; Docker Desktop's

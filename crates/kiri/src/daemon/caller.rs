@@ -2,10 +2,18 @@
 //! the window, tools run by the person), or a container that was given the
 //! engine's socket (`-v /var/run/docker.sock:/var/run/docker.sock`).
 //!
-//! Docker's API has nothing that changes the daemon's own settings, so a
-//! container with the socket cannot change them through it. Kiri's settings
-//! endpoints that Docker has no counterpart for stay that way: only this
-//! machine's programs may use them.
+//! What this stops: a container changing Kiri's settings through the
+//! engine's API. Docker's API has nothing that changes the engine's own
+//! settings, and Kiri's own endpoints that change something (its settings,
+//! Stop, Sleep, ports, USB, the builder's limits) refuse a container's
+//! connection (api.rs, `CONTAINER_MAY`).
+//!
+//! What it doesn't, as with Docker:
+//! - A container you give writable host folders (`-v $HOME:/m`) can change
+//!   your files there, Kiri's settings among them.
+//! - A container that may create containers with `--privileged`,
+//!   `--pid=host`, `SYS_ADMIN`, `--device` or a mount of the host's root
+//!   is as good as root on this machine.
 //!
 //! Which one a connection is comes from where it arrived, never from
 //! anything the other end says or is:
