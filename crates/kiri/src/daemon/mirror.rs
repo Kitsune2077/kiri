@@ -173,9 +173,11 @@ fn add_mirror(tables: &mut Vec<(String, Table)>, registry: &str, mirror: String)
 }
 
 /// The registries buildkitd.toml has tables for: Docker Hub, and each one
-/// an image in the store came from (not this machine's).
+/// an image in the store came from (not this machine's), or came from
+/// since the engine started, so removing a registry's last image leaves
+/// builds from it as they were.
 pub fn registry_names(engine: &Engine) -> Vec<String> {
-    let mut names = vec!["docker.io".to_owned()];
+    let mut names = Vec::new();
     for i in engine.store.images().unwrap_or_default() {
         if let Ok(r) = Reference::parse(&i.name)
             && !names.contains(&r.registry)
@@ -184,15 +186,35 @@ pub fn registry_names(engine: &Engine) -> Vec<String> {
             names.push(r.registry);
         }
     }
+    remembered(names)
+}
+
+/// Registries the store's images have named since the engine started: a
+/// few dozen at most, bounded all the same.
+static SEEN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+const MAX_SEEN: usize = 256;
+
+/// `now` (the store's registries) with those [`SEEN`] before, Docker Hub
+/// first; `now` is remembered too.
+fn remembered(now: Vec<String>) -> Vec<String> {
+    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
+    for r in now {
+        if !seen.contains(&r) && seen.len() < MAX_SEEN {
+            seen.push(r);
+        }
+    }
+    let mut names = vec!["docker.io".to_owned()];
+    names.extend(seen.iter().filter(|r| r.as_str() != "docker.io").cloned());
     names
 }
 
 /// Those of `names` reached without verified TLS by `c`: what buildkitd.toml
 /// marks `http` and `insecure` beyond the hosts `c` names itself (a network
-/// entry covers a registry only once an image from it is in the store).
+/// entry covers a registry only once an image from it has been pulled).
 pub fn unverified(c: &kiri_image::RegistryConfig, names: &[String]) -> Vec<String> {
     let mut out: Vec<String> = names.iter().filter(|n| c.is_unverified(n)).cloned().collect();
     out.sort();
+    out.dedup();
     out
 }
 
@@ -363,6 +385,19 @@ fn lookup(engine: &Engine, path: &str, token: &str) -> Option<Found> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A registry the store named once keeps its builder table after its
+    /// last image is removed: the builder is not restarted without it.
+    #[test]
+    fn a_registry_seen_once_keeps_its_builder_table() {
+        let first = remembered(vec!["10.77.0.9:5000".into(), "docker.io".into()]);
+        assert_eq!(first[0], "docker.io");
+        assert_eq!(first.iter().filter(|r| *r == "docker.io").count(), 1);
+        let later = remembered(Vec::new());
+        assert!(later.contains(&"10.77.0.9:5000".to_owned()), "{later:?}");
+        let c = kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("10.0.0.0/8").unwrap()], ..Default::default() };
+        assert_eq!(unverified(&c, &["10.77.0.9:5000".into(), "10.77.0.9:5000".into()]), ["10.77.0.9:5000"]);
+    }
 
     /// daemon.json's hosts merge into one table each, as BuildKit wants:
     /// every host a pull reaches unverified is http and insecure in builds
