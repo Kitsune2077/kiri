@@ -486,8 +486,10 @@ fn joined(from: &str, location: &str) -> String {
     } else if location.starts_with('?') {
         format!("{from}{location}")
     } else {
-        let dir = &from[..from.rfind('/').filter(|&i| i >= origin.len()).map_or(from.len(), |i| i + 1)];
-        if dir.len() == from.len() { format!("{origin}/{location}") } else { format!("{dir}{location}") }
+        match from.rfind('/').filter(|&i| i >= origin.len()) {
+            Some(i) => format!("{}{location}", &from[..=i]),
+            None => format!("{origin}/{location}"),
+        }
     }
 }
 
@@ -1399,6 +1401,9 @@ impl Client {
     /// included. A redirect from HTTPS to plain HTTP goes only to a host
     /// `owner` may send people to without TLS ([`Client::unverified_ok`]).
     fn hop(&self, owner: &str, origin: &str, current: &str, location: &str, keep_auth: bool) -> Result<(String, bool), ureq::Error> {
+        if location.trim().is_empty() {
+            return Err(ureq::Error::Io(io::Error::other(format!("{current} redirects without a Location"))));
+        }
         let next = joined(current, location);
         let refuse = |why: &str| ureq::Error::Io(io::Error::other(format!("{current} redirects to {next}: {why}")));
         if !(is_https(&next) || next.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://"))) {
@@ -1719,7 +1724,10 @@ impl Client {
                 req.send_empty()
             })?;
             let started = ok(started, &start_url)?;
-            let location = started.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
+            let location = started.headers().get("location").and_then(|v| v.to_str().ok()).unwrap_or_default().trim().to_owned();
+            if location.is_empty() {
+                return Err(Error::Http(format!("{start_url} started an upload without saying where to send it (no Location)")));
+            }
             let location = joined(&start_url, &location);
             let put_url = format!("{location}{}digest={digest}", if location.contains('?') { '&' } else { '?' });
             // The registry's credentials go to the upload address only when
@@ -2385,6 +2393,13 @@ mod tests {
     /// A registry that takes every push: blobs are missing until put, and
     /// it records what it was sent, by digest. `QUIT` ends it.
     fn push_server() -> (String, std::thread::JoinHandle<HashMap<String, Vec<u8>>>) {
+        push_server_with("/v2/t/blobs/uploads/1")
+    }
+
+    /// [`push_server`] that starts each upload with `location` as its
+    /// `Location` (none at all when empty), and records each blob's upload
+    /// path too, as `path:<path>`.
+    fn push_server_with(location: &'static str) -> (String, std::thread::JoinHandle<HashMap<String, Vec<u8>>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let host = listener.local_addr().unwrap().to_string();
         let served = std::thread::spawn(move || {
@@ -2423,14 +2438,16 @@ mod tests {
                         continue 'conns;
                     }
                     let reply = if first.starts_with("HEAD") {
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".to_owned()
                     } else if first.starts_with("POST") {
-                        "HTTP/1.1 202 Accepted\r\nLocation: /v2/t/blobs/uploads/1\r\nContent-Length: 0\r\n\r\n"
+                        let at = if location.is_empty() { String::new() } else { format!("Location: {location}\r\n") };
+                        format!("HTTP/1.1 202 Accepted\r\n{at}Content-Length: 0\r\n\r\n")
                     } else {
                         if !path.contains("/manifests/") {
+                            blobs.insert(format!("path:{}", path.split('?').next().unwrap_or_default()), Vec::new());
                             blobs.insert(path.split("digest=").nth(1).unwrap_or_default().to_owned(), body);
                         }
-                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n"
+                        "HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n".to_owned()
                     };
                     std::io::Write::write_all(c.get_mut(), reply.as_bytes()).unwrap();
                 }
@@ -2470,6 +2487,55 @@ mod tests {
         pushed.unwrap();
         assert!(blobs.contains_key(&layer), "the layer went up");
         assert!(blobs.contains_key(&cfg), "the config went up");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A one-layer image in a fresh store under `name`.
+    fn push_image(name: &str) -> (std::path::PathBuf, Store, Image) {
+        use std::io::Write as _;
+        let root = std::env::temp_dir().join(format!("kiri-push-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = Store::open(&root).unwrap();
+        let put = |bytes: &[u8]| {
+            let mut w = store.ingest().unwrap();
+            w.write_all(bytes).unwrap();
+            w.finish().unwrap()
+        };
+        let (layer, size) = put(b"\x1f\x8bnot really gzip");
+        let config = serde_json::json!({"os": "linux", "architecture": "amd64", "config": {}});
+        let (cfg, _) = put(&serde_json::to_vec(&config).unwrap());
+        let image = crate::archive::from_config(format!("{name}:1"), &cfg, &config, vec![Layer { digest: layer, size, media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into() }]);
+        store.put_image(image.clone()).unwrap();
+        (root, store, image)
+    }
+
+    /// An upload started with a relative `Location` is sent under the
+    /// upload path it was started at, as RFC 3986 joins it.
+    #[test]
+    fn a_relative_upload_location_stays_under_the_upload_path() {
+        let (root, store, image) = push_image("rel");
+        let (host, served) = push_server_with("7f3a");
+        let target = Reference::parse(&format!("{host}/t:1")).unwrap();
+        let pushed = test_client().push(&store, &image, &target, &|_| {});
+        quit(&host);
+        let blobs = served.join().unwrap();
+        pushed.unwrap();
+        assert!(blobs.contains_key("path:/v2/t/blobs/uploads/7f3a"), "{:?}", blobs.keys().collect::<Vec<_>>());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// An upload started without a `Location` has nowhere to go: the push
+    /// stops there, and no blob is sent anywhere.
+    #[test]
+    fn an_upload_without_a_location_is_refused() {
+        let (root, store, image) = push_image("noloc");
+        let (host, served) = push_server_with("");
+        let target = Reference::parse(&format!("{host}/t:1")).unwrap();
+        let pushed = test_client().push(&store, &image, &target, &|_| {});
+        quit(&host);
+        let blobs = served.join().unwrap();
+        assert!(pushed.is_err());
+        assert!(blobs.is_empty(), "{:?}", blobs.keys().collect::<Vec<_>>());
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2754,6 +2820,10 @@ mod tests {
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "/storage/x"), "https://r.lan:5000/storage/x");
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "y"), "https://r.lan:5000/v2/a/blobs/y");
         assert_eq!(joined("https://r.lan:5000", "y"), "https://r.lan:5000/y");
+        // A URL that ends in `/` is its own directory: an upload's relative
+        // Location stays under the upload path.
+        assert_eq!(joined("https://r.lan:5000/v2/a/blobs/uploads/", "6d1c"), "https://r.lan:5000/v2/a/blobs/uploads/6d1c");
+        assert_eq!(joined("https://r.lan:5000/", "y"), "https://r.lan:5000/y");
         // A scheme is letters before `://`, not any `://` in the text.
         assert_eq!(joined("https://r.lan:5000/v2/a/blobs/x", "/blob?next=https://evil.example/x"), "https://r.lan:5000/blob?next=https://evil.example/x");
         assert_eq!(joined("https://r.lan:5000/v2/a", "ftp://files.example/x"), "ftp://files.example/x");
