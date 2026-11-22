@@ -1029,34 +1029,34 @@ impl Client {
     }
 
     /// [`Client::anonymous`] for the mirror at `target`: it is asked over
-    /// the scheme its address was written with, as Docker asks a mirror,
-    /// with no probe and no fall back from HTTPS to plain HTTP. HTTPS to a
-    /// mirror on this machine or in `insecure-registries` leaves the
+    /// `scheme` (the scheme its address was written with), as Docker asks a
+    /// mirror, with no probe and no fall back from HTTPS to plain HTTP. HTTPS
+    /// to a mirror on this machine or in `insecure-registries` leaves the
     /// certificate unchecked, as for any registry there.
-    fn for_mirror(&self, target: &Reference) -> Client {
-        let scheme = self.mirrors().into_iter().find(|m| m.host.eq_ignore_ascii_case(&target.registry)).map(|m| if m.http { "http" } else { "https" });
+    fn for_mirror(&self, target: &Reference, scheme: Option<&'static str>) -> Client {
         Client { mirror_scheme: scheme.map(|s| (target.registry.clone(), s)), ..self.anonymous() }
     }
 
     /// The references a pull of `name` tries, in order: the configured
-    /// mirrors of Docker Hub, then Docker Hub itself. Only Hub is mirrored,
-    /// as with Docker's `registry-mirrors`. A pull signed in to Docker Hub
-    /// asks the mirrors only for its official images (`library/…`, all
-    /// public): any other repository may be the person's private one, whose
-    /// name a mirror must not learn and whose content it must not stand in
-    /// for. Docker asks the mirrors for those too.
-    fn targets(&self, name: &Reference) -> Vec<Reference> {
-        let mut targets: Vec<Reference> = Vec::new();
+    /// mirrors of Docker Hub (each carrying the scheme it was written with),
+    /// then Docker Hub itself (`None`). Only Hub is mirrored, as with
+    /// Docker's `registry-mirrors`. A pull signed in to Docker Hub asks the
+    /// mirrors only for its official images (`library/…`, all public): any
+    /// other repository may be the person's private one, whose name a mirror
+    /// must not learn and whose content it must not stand in for. Docker asks
+    /// the mirrors for those too.
+    fn targets(&self, name: &Reference) -> Vec<(Reference, Option<&'static str>)> {
+        let mut targets: Vec<(Reference, Option<&'static str>)> = Vec::new();
         let private_maybe = self.credentials.is_some() && !name.repository.starts_with("library/");
         if name.registry == "docker.io" && !private_maybe {
             for mirror in self.mirrors() {
-                let target = name.via(&mirror.host, mirror.prefix.as_deref());
+                let target = (name.via(&mirror.host, mirror.prefix.as_deref()), Some(if mirror.http { "http" } else { "https" }));
                 if !targets.contains(&target) {
                     targets.push(target);
                 }
             }
         }
-        targets.push(name.clone());
+        targets.push((name.clone(), None));
         targets
     }
 
@@ -1096,22 +1096,22 @@ impl Client {
         &self,
         store: &Store,
         name: &Reference,
-        targets: &[Reference],
+        targets: &[(Reference, Option<&'static str>)],
         platform: &Platform,
         progress: &(dyn Fn(Progress) + Sync),
         cancel: &Cancel,
     ) -> Result<Image, Error> {
         let _on = cancel.enter();
         let mut last: Option<Error> = None;
-        for target in targets {
+        for (target, scheme) in targets {
             if cancel.is_cancelled() {
                 return Err(Error::Cancelled);
             }
             // A mirror is asked without the user's Docker Hub credentials;
             // the official registry is asked with them. The layers come from
             // where the manifest did, asked the same way.
-            let mirror = target.registry != name.registry;
-            let anonymous = mirror.then(|| self.for_mirror(target));
+            let mirror = scheme.is_some() || target.registry != name.registry;
+            let anonymous = mirror.then(|| self.for_mirror(target, *scheme));
             let client = anonymous.as_ref().unwrap_or(self);
             // A mirror that fails anywhere in the pull (no manifest, a layer
             // missing or wrong, an image for another platform) hands it to
@@ -2739,14 +2739,14 @@ mod tests {
             ..Default::default()
         });
         let targets = client.targets(&hub);
-        let hosts: Vec<&str> = targets.iter().map(|r| r.registry.as_str()).collect();
+        let hosts: Vec<&str> = targets.iter().map(|(r, _)| r.registry.as_str()).collect();
         assert_eq!(hosts, ["mirror.example.com", "mirror.example.net", "docker.io"]);
-        assert_eq!(targets[1].repository, "docker.io/library/nginx");
-        assert_eq!(targets[2].repository, "library/nginx");
-        assert_eq!(targets[2].reference, "1.27");
+        assert_eq!(targets[1].0.repository, "docker.io/library/nginx");
+        assert_eq!(targets[2].0.repository, "library/nginx");
+        assert_eq!(targets[2].0.reference, "1.27");
 
         let ghcr = Reference::parse("ghcr.io/o/r:v1").unwrap();
-        assert_eq!(client.targets(&ghcr), vec![ghcr.clone()]);
+        assert_eq!(client.targets(&ghcr), vec![(ghcr.clone(), None)]);
     }
 
     #[test]
@@ -2756,7 +2756,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-mirror-hit-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let name = Reference::parse("alpine:3.22").unwrap();
-        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let targets = vec![(name.via(&mirror, None), None), (name.via(&origin, None), None)];
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let image = test_client().pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
         assert_eq!(image.name, "alpine:3.22", "the mirror's name never shows");
@@ -2774,7 +2774,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-mirror-creds-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let name = Reference::parse("alpine:3.22").unwrap();
-        let targets = vec![name.via(&mirror, None), name.clone()];
+        let targets = vec![(name.via(&mirror, None), None), (name.clone(), None)];
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let signed_in = test_client().with_credentials(Some(Credentials { username: "alice".into(), password: "hub-password".into(), registry_token: "hub-token".into(), ..Default::default() }));
         let image = signed_in.pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
@@ -2794,7 +2794,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-mirror-miss-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let name = Reference::parse("alpine:3.22").unwrap();
-        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let targets = vec![(name.via(&mirror, None), None), (name.via(&origin, None), None)];
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let image = test_client().pull_from(&store, &name, &targets, &platform, &|_| {}, &Cancel::new()).unwrap();
         assert_eq!(image.name, "alpine:3.22");
@@ -2812,7 +2812,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-mirror-cancel-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let name = Reference::parse("alpine:3.22").unwrap();
-        let targets = vec![name.via(&mirror, None), name.via(&origin, None)];
+        let targets = vec![(name.via(&mirror, None), None), (name.via(&origin, None), None)];
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let cancel = Cancel::new();
         cancel.cancel();
@@ -2934,9 +2934,10 @@ mod tests {
         let hub = Reference::parse("alpine:3").unwrap();
         for (written, scheme) in [(format!("https://{host}"), "https"), (format!("http://{host}"), "http")] {
             let c = test_client().with_config(RegistryConfig { insecure: Vec::new(), mirrors: vec![Mirror::parse(&written).unwrap()] });
-            let target = c.targets(&hub).remove(0);
+            let (target, carried) = c.targets(&hub).remove(0);
             assert_eq!(target.registry, host);
-            let m = c.for_mirror(&target);
+            assert_eq!(carried, Some(scheme));
+            let m = c.for_mirror(&target, carried);
             assert_eq!(m.base(&target.registry), format!("{scheme}://{host}"), "{written}");
             assert_eq!(m.known_scheme(&target.registry), Some(scheme));
             assert!(m.credentials.is_none() && !m.use_mirrors);
@@ -2944,7 +2945,49 @@ mod tests {
         assert_eq!(conns.load(Ordering::SeqCst), 0, "no probe");
         // Docker Hub itself, on the same client, is not touched by it.
         let c = test_client().with_config(RegistryConfig { insecure: Vec::new(), mirrors: vec![Mirror::parse(&format!("http://{host}")).unwrap()] });
-        assert_eq!(c.for_mirror(&Reference::parse(&format!("{host}/library/alpine:3")).unwrap()).base("registry-1.docker.io"), "https://registry-1.docker.io");
+        assert_eq!(c.for_mirror(&Reference::parse(&format!("{host}/library/alpine:3")).unwrap(), Some("http")).base("registry-1.docker.io"), "https://registry-1.docker.io");
+    }
+
+    /// Two mirrors on the same host with different prefixes and schemes each
+    /// keep the scheme they were written with: `https://` never downgrades
+    /// to plain HTTP because an earlier mirror on the same host was `http://`,
+    /// and `http://` is not sent over HTTPS because an earlier one was `https://`.
+    #[test]
+    fn same_host_mirrors_keep_each_mirrors_scheme() {
+        let hub = Reference::parse("alpine:3").unwrap();
+        let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
+        for (first, second, want_first, want_second) in [
+            ("http", "https", "http", "https"),
+            ("https", "http", "https", "http"),
+        ] {
+            let cancel = Arc::new(Cancel::new());
+            let stop = cancel.clone();
+            let (host, seen) = dual_recording_server(move |_scheme, head| {
+                if head.contains("/v2/b/") {
+                    stop.cancel();
+                }
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into()
+            });
+            let mirrors = vec![
+                Mirror::parse(&format!("{first}://{host}/a")).unwrap(),
+                Mirror::parse(&format!("{second}://{host}/b")).unwrap(),
+            ];
+            let root = std::env::temp_dir().join(format!("kiri-same-host-mirror-{first}-{second}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            let store = Store::open(&root).unwrap();
+            let client = test_client().with_config(RegistryConfig { insecure: Vec::new(), mirrors });
+            let _ = client.pull_with(&store, &hub, &platform, &|_| {}, &cancel);
+            let _ = std::fs::remove_dir_all(&root);
+            let reqs: Vec<(&'static str, String)> = seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(s, h)| (*s, h.lines().next().and_then(|l| l.split_whitespace().nth(1)).unwrap_or("").to_owned()))
+                .collect();
+            assert!(reqs.iter().any(|(s, p)| *s == want_first && p.starts_with("/v2/a/")), "{first}->{second}: {reqs:?}");
+            assert!(reqs.iter().any(|(s, p)| *s == want_second && p.starts_with("/v2/b/")), "{first}->{second}: {reqs:?}");
+            assert!(!reqs.iter().any(|(s, p)| *s != want_second && p.starts_with("/v2/b/")), "{first}->{second}: {reqs:?}");
+        }
     }
 
     /// A registry on self-signed HTTPS that answers 401: it answered
@@ -2985,7 +3028,7 @@ mod tests {
         let name = Reference::parse("alpine:3.22").unwrap();
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let signed_in = test_client().with_credentials(Some(Credentials { username: "alice".into(), password: "hub-password".into(), registry_token: "hub-token".into(), ..Default::default() }));
-        assert!(signed_in.pull_from(&store, &name, &[name.via(&mirror, None)], &platform, &|_| {}, &Cancel::new()).is_err());
+        assert!(signed_in.pull_from(&store, &name, &[(name.via(&mirror, None), None)], &platform, &|_| {}, &Cancel::new()).is_err());
         let heads = seen.lock().unwrap().join("\n").to_ascii_lowercase();
         assert!(heads.contains("get /token"), "the mirror's challenge was answered: {heads}");
         let token_request = heads.split("\r\n\r\n").find(|h| h.contains("get /token")).unwrap_or_default().to_owned();
@@ -3108,6 +3151,61 @@ mod tests {
 
     fn tls_recording_server(reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
         serve_recording(true, reply)
+    }
+
+    type SchemeLog = Arc<Mutex<Vec<(&'static str, String)>>>;
+
+    /// A server on one port that answers both TLS (ClientHello `0x16`) and
+    /// plain HTTP, recording each request with the scheme it arrived over.
+    fn dual_recording_server(reply: impl Fn(&'static str, &str) -> String + Send + Sync + 'static) -> (String, SchemeLog) {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_owned()]).unwrap().self_signed(&key).unwrap();
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = Arc::new(
+            rustls::ServerConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.der().clone()], rustls::pki_types::PrivatePkcs8KeyDer::from(key.serialize_der()).into())
+                .unwrap(),
+        );
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let log = seen.clone();
+        let reply = Arc::new(reply);
+        std::thread::spawn(move || {
+            for sock in listener.incoming().flatten() {
+                let (log, reply, config) = (log.clone(), reply.clone(), config.clone());
+                std::thread::spawn(move || {
+                    let _ = sock.set_read_timeout(Some(Duration::from_secs(10)));
+                    let mut first = [0u8; 1];
+                    let tls = sock.peek(&mut first).unwrap_or(0) == 1 && first[0] == 0x16;
+                    let scheme = if tls { "https" } else { "http" };
+                    let mut stream: Box<dyn ReadWrite> = if tls {
+                        match rustls::ServerConnection::new(config) {
+                            Ok(conn) => Box::new(rustls::StreamOwned::new(conn, sock)),
+                            Err(_) => return,
+                        }
+                    } else {
+                        Box::new(sock)
+                    };
+                    let mut head = Vec::new();
+                    let mut b = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") && stream.read(&mut b).unwrap_or(0) == 1 {
+                        head.push(b[0]);
+                    }
+                    let head = String::from_utf8_lossy(&head).to_string();
+                    if head.is_empty() {
+                        return;
+                    }
+                    log.lock().unwrap().push((scheme, head.clone()));
+                    let _ = stream.write_all(reply(scheme, &head).as_bytes());
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (host, seen)
     }
 
     fn serve_recording(tls: bool, reply: impl Fn(&str) -> String + Send + Sync + 'static) -> (String, Arc<Mutex<Vec<String>>>) {
@@ -3587,7 +3685,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         let store = Store::open(&root).unwrap();
         let name = Reference::parse("alpine:3.22").unwrap();
-        let targets = vec![name.via(mirror, None), name.via(origin, None)];
+        let targets = vec![(name.via(mirror, None), None), (name.via(origin, None), None)];
         let platform = Platform { os: "linux".into(), architecture: "amd64".into() };
         let said = Mutex::new(Vec::new());
         let result = test_client().pull_from(&store, &name, &targets, &platform, &|p| said.lock().unwrap().push(p), &Cancel::new());
@@ -3712,7 +3810,7 @@ mod tests {
         let own = Reference::parse("someone/private:1").unwrap();
         assert_eq!(client.targets(&own).len(), 2, "anonymous: the mirror, then Hub");
         assert_eq!(signed_in.targets(&official).len(), 2);
-        assert_eq!(signed_in.targets(&own), vec![own.clone()], "signed in: Hub only");
+        assert_eq!(signed_in.targets(&own), vec![(own.clone(), None)], "signed in: Hub only");
     }
 
     /// A plain-HTTP mirror on a host nobody marked insecure is not asked.
@@ -3721,7 +3819,7 @@ mod tests {
         let hub = Reference::parse("alpine:3.22").unwrap();
         let mirrors = vec![Mirror::parse("http://mirror.lan:5000").unwrap(), Mirror::parse("https://mirror.example.com").unwrap()];
         let unlisted = Client::new().with_config(RegistryConfig { mirrors: mirrors.clone(), ..Default::default() });
-        let hosts = |c: &Client| c.targets(&hub).into_iter().map(|r| r.registry).collect::<Vec<_>>();
+        let hosts = |c: &Client| c.targets(&hub).into_iter().map(|(r, _)| r.registry).collect::<Vec<_>>();
         assert_eq!(hosts(&unlisted), ["mirror.example.com", "docker.io"]);
         let listed = Client::new().with_config(RegistryConfig { mirrors, insecure: vec![crate::config::Insecure::parse("mirror.lan:5000").unwrap()] });
         assert_eq!(hosts(&listed), ["mirror.lan:5000", "mirror.example.com", "docker.io"]);
