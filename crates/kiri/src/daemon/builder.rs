@@ -215,7 +215,7 @@ fn create(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, Error> {
     crate::diag::info!("builder created", name = name);
     let id = made["Id"].as_str().unwrap_or_default().to_owned();
     // Before its first start, whoever starts it (buildx, for one).
-    write_config(engine, &id);
+    let _ = write_config(engine, &id);
     Ok(id)
 }
 
@@ -231,9 +231,7 @@ pub fn start(engine: &Engine, key: &str) -> Option<Result<(), Error>> {
     start_with(
         &ENSURE,
         || find(engine).map(|(id, st)| (id, st == Status::Running)),
-        |id| {
-            write_config(engine, id);
-        },
+        |id| write_config(engine, id),
         |id| {
             let started = engine.start(id);
             if started.is_ok() {
@@ -247,13 +245,13 @@ pub fn start(engine: &Engine, key: &str) -> Option<Result<(), Error>> {
 fn start_with(
     lock: &Mutex<()>,
     find: impl FnOnce() -> Option<(String, bool)>,
-    write: impl FnOnce(&str),
+    write: impl FnOnce(&str) -> Result<(), Error>,
     start: impl FnOnce(&str) -> Result<(), Error>,
 ) -> Option<Result<(), Error>> {
     let _g = lock.lock().unwrap_or_else(|e| e.into_inner());
     let (id, running) = find()?;
-    if !running {
-        write(&id);
+    if !running && let Err(e) = write(&id) {
+        return Some(Err(e));
     }
     Some(start(&id))
 }
@@ -290,20 +288,21 @@ fn is_stale(written: Option<&Registries>, current: &Registries) -> bool {
 
 /// The garbage collector's limits and the registries, for buildkitd's next
 /// start. [`WRITTEN`] says so only once the file is in place.
-fn write_config(engine: &Engine, id: &str) -> bool {
+fn write_config(engine: &Engine, id: &str) -> Result<(), Error> {
     let names = super::mirror::registry_names(engine);
     let current = Registries::now(&names);
     let toml = config_toml(cache_limit(), &super::mirror::config(engine, &current.config, &names));
     let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(toml.as_bytes()))]);
     let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
     *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then(|| std::sync::Arc::new(current));
-    if let Err(e) = &written {
+    if let Err(e) = written {
         crate::diag::warn!("builder config not written", error = format!("{e:?}"));
+        return Err(e);
     }
     if kiri_vmm::rosetta_installed() {
         hide_amd64_qemu(engine, id);
     }
-    written.is_ok()
+    Ok(())
 }
 
 /// Applies a changed registry setting to a stopped stale builder right
@@ -318,7 +317,7 @@ pub fn refresh(engine: &Engine) {
         || stale_now(engine),
         || engine.is_awake(),
         |id| {
-            write_config(engine, id);
+            let _ = write_config(engine, id);
         },
     );
 }
@@ -350,7 +349,7 @@ fn stop_then_write(engine: &Engine, id: &str) -> bool {
         engine.is_paused(id),
         || engine.pause(id, false),
         || engine.stop(id, Duration::from_secs(10)).map(|_| ()),
-        || write_config(engine, id),
+        || write_config(engine, id).is_ok(),
     )
 }
 
@@ -559,7 +558,7 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
         engine.stop(&id, Duration::from_secs(10))?;
     }
     if status != Status::Running || stale {
-        write_config(engine, &id);
+        write_config(engine, &id)?;
         say("Starting Kiri's builder (BuildKit)");
         engine.start(&id)?;
     } else if engine.is_paused(&id) {
@@ -1616,6 +1615,7 @@ mod tests {
             |id| {
                 assert!(lock.try_lock().is_err(), "ENSURE must be held during write");
                 log.borrow_mut().push(format!("write:{id}"));
+                Ok(())
             },
             |id| {
                 assert!(lock.try_lock().is_err(), "ENSURE must be held during start");
@@ -1630,7 +1630,10 @@ mod tests {
         let res = start_with(
             &lock,
             || Some(("b1".into(), true)),
-            |id| log.borrow_mut().push(format!("write:{id}")),
+            |id| {
+                log.borrow_mut().push(format!("write:{id}"));
+                Ok(())
+            },
             |id| {
                 log.borrow_mut().push(format!("start:{id}"));
                 Ok(())
@@ -1640,6 +1643,25 @@ mod tests {
         assert_eq!(*log.borrow(), ["start:b1"], "already running builder must not be written into");
 
         assert!(start_with(&lock, || None, |_| panic!("wrote"), |_| panic!("started")).is_none());
+    }
+
+    /// `start` does not boot the builder when writing `buildkitd.toml` fails,
+    /// returning the write error instead of starting with stale config.
+    #[test]
+    fn start_aborts_when_writing_config_fails() {
+        let lock = Mutex::new(());
+        let mut started = false;
+        let res = start_with(
+            &lock,
+            || Some(("b1".into(), false)),
+            |_| Err(Error::Io(io::Error::other("copy_in failed"))),
+            |_| {
+                started = true;
+                Ok(())
+            },
+        );
+        assert!(!started, "must not start builder when write_config fails");
+        assert!(matches!(res, Some(Err(Error::Io(ref e))) if e.to_string().contains("copy_in failed")), "{res:?}");
     }
 
     /// BuildKit looks the emulator up by name and skips it when it isn't
