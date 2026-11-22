@@ -234,15 +234,25 @@ pub fn before_start(engine: &Engine, key: &str) {
     write_config(engine, &id);
 }
 
-/// The garbage collector's limits, for buildkitd's next start.
 /// daemon.json's registry settings as the builder's config last had them,
-/// so a hand edit reaches a running builder at the next build.
+/// so a hand edit reaches a running builder at the next build. `None` until
+/// this daemon has written the file: a builder found running then (left from
+/// before the daemon started) may have anything, and is treated as stale.
 static WRITTEN: std::sync::Mutex<Option<std::sync::Arc<kiri_image::RegistryConfig>>> = std::sync::Mutex::new(None);
 
+/// Whether a running builder's registry settings are not today's.
+fn is_stale(written: Option<&kiri_image::RegistryConfig>, current: &kiri_image::RegistryConfig) -> bool {
+    written.is_none_or(|w| w != current)
+}
+
+/// The garbage collector's limits and the registries, for buildkitd's next
+/// start. [`WRITTEN`] says so only once the file is in place.
 fn write_config(engine: &Engine, id: &str) {
-    *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = Some(super::daemon_json::current());
+    let current = super::daemon_json::current();
     let archive = tar(&[("buildkit/", None), ("buildkit/buildkitd.toml", Some(config_toml(cache_limit(), &super::mirror::config(engine)).as_bytes()))]);
-    if let Err(e) = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive)) {
+    let written = copy_in(engine, id, "/etc", &mut io::Cursor::new(archive));
+    *WRITTEN.lock().unwrap_or_else(|e| e.into_inner()) = written.is_ok().then_some(current);
+    if let Err(e) = written {
         crate::diag::warn!("builder config not written", error = format!("{e:?}"));
     }
     if kiri_vmm::rosetta_installed() {
@@ -363,9 +373,7 @@ fn ensure_running(engine: &Engine, say: &mut dyn FnMut(&str)) -> Result<String, 
     // daemon.json edited by hand since the builder started (Settings and
     // `kiri registry` refresh it at once): restarted with the new file
     // while no build uses it, as buildkitd reads it only when it starts.
-    let stale = status == Status::Running
-        && !builder_busy(engine, &id)
-        && WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref().is_some_and(|w| *w != *super::daemon_json::current());
+    let stale = status == Status::Running && !builder_busy(engine, &id) && is_stale(WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).as_deref(), &super::daemon_json::current());
     if stale {
         if engine.is_paused(&id) {
             engine.pause(&id, false)?;
@@ -1136,6 +1144,15 @@ mod tests {
 
     /// A busy builder (a build, or a buildx session) is never stopped, and
     /// its recorded config is not advanced.
+    #[test]
+    fn a_builder_whose_config_is_unknown_or_old_is_stale() {
+        let none = kiri_image::RegistryConfig::default();
+        let some = kiri_image::RegistryConfig { insecure: vec![kiri_image::Insecure::parse("registry.lan:5000").unwrap()], ..Default::default() };
+        assert!(is_stale(None, &none), "never written by this daemon");
+        assert!(is_stale(Some(&none), &some));
+        assert!(!is_stale(Some(&some), &some));
+    }
+
     #[test]
     fn a_settings_change_never_stops_a_busy_builder() {
         assert_eq!(refresh_action(true, true), Refresh::Leave);

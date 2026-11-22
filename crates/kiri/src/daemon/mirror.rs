@@ -174,24 +174,24 @@ fn add_mirror(tables: &mut Vec<(String, Table)>, registry: &str, mirror: String)
 
 pub fn config(engine: &Engine) -> String {
     let mut tables: Vec<(String, Table)> = Vec::new();
+    let mut names = vec!["docker.io".to_owned()];
+    for i in engine.store.images().unwrap_or_default() {
+        if let Ok(r) = Reference::parse(&i.name)
+            && !names.contains(&r.registry)
+            && !kiri_image::reference::is_local(&r.registry)
+        {
+            names.push(r.registry);
+        }
+    }
     if let Some(port) = LISTENING.get().copied().flatten() {
         let host = format!("{}:{port}", mirror_host(&engine.lock_net()));
         let token = token();
-        let mut names = vec!["docker.io".to_owned()];
-        for i in engine.store.images().unwrap_or_default() {
-            if let Ok(r) = Reference::parse(&i.name)
-                && !names.contains(&r.registry)
-                && !kiri_image::reference::is_local(&r.registry)
-            {
-                names.push(r.registry);
-            }
-        }
-        for name in names {
-            add_mirror(&mut tables, &name, format!("{host}/{token}/{name}"));
+        for name in &names {
+            add_mirror(&mut tables, name, format!("{host}/{token}/{name}"));
         }
         table(&mut tables, &host).http = true;
     }
-    registries(&mut tables, &super::daemon_json::current());
+    registries(&mut tables, &super::daemon_json::current(), &names);
     let mut out = String::new();
     for (registry, t) in tables {
         out.push_str(&format!("[registry.\"{registry}\"]\n"));
@@ -209,23 +209,33 @@ pub fn config(engine: &Engine) -> String {
     out
 }
 
-/// daemon.json's part of buildkitd.toml. Its Docker Hub mirrors come after
-/// Kiri's own mirror, which serves images built or loaded here and answers
-/// 404 for everything else; a plain-HTTP one is asked over HTTP. Each
-/// insecure host is `http` and `insecure`, as Docker sets them for its
-/// builder: BuildKit then tries HTTPS without checking the certificate,
-/// then HTTP. A network entry has no host to name, so builds reach only
-/// the hosts listed by name (BuildKit has no network form).
-fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig) {
-    for mirror in &c.mirrors {
+/// daemon.json's part of buildkitd.toml, so a build reaches each registry
+/// the way a pull does. Its Docker Hub mirrors (the usable ones:
+/// `RegistryConfig::mirror_allowed`) come after Kiri's own mirror, which
+/// serves images built or loaded here and answers 404 for everything else.
+/// Every host a pull reaches without verified TLS (a listed host, a mirror
+/// on one, a registry the store's images name inside a listed network) is
+/// `http` and `insecure`, as Docker sets them for its builder: BuildKit then
+/// tries HTTPS without checking the certificate, then HTTP, as a pull does.
+/// Every other host keeps verified HTTPS, a plain-HTTP mirror's host
+/// included (such a mirror is used only when its host is listed). BuildKit
+/// has no network form, so a network reaches builds through the registries
+/// in `known` (the store's), and a listed host's own table.
+fn registries(tables: &mut Vec<(String, Table)>, c: &kiri_image::RegistryConfig, known: &[String]) {
+    let mut unverified: Vec<&str> = Vec::new();
+    for mirror in c.usable_mirrors() {
         add_mirror(tables, "docker.io", mirror.buildkit());
-        if mirror.http {
-            table(tables, &mirror.host).http = true;
-        }
+        unverified.push(&mirror.host);
     }
     for e in &c.insecure {
         if let kiri_image::Insecure::Host(h) = e {
-            let t = table(tables, h);
+            unverified.push(h);
+        }
+    }
+    unverified.extend(known.iter().map(String::as_str));
+    for host in unverified {
+        if c.is_unverified(host) {
+            let t = table(tables, host);
             t.http = true;
             t.insecure = true;
         }
@@ -338,8 +348,9 @@ mod tests {
     use super::*;
 
     /// daemon.json's hosts merge into one table each, as BuildKit wants:
-    /// insecure ones are http and insecure, plain-HTTP mirrors http, and a
-    /// network (no host to name) adds nothing.
+    /// every host a pull reaches unverified is http and insecure in builds
+    /// too, a network covers the registries the store names inside it, and
+    /// nothing else changes.
     #[test]
     fn daemon_json_registries_share_one_table_each() {
         let c = kiri_image::RegistryConfig {
@@ -348,15 +359,28 @@ mod tests {
         };
         let mut tables = Vec::new();
         add_mirror(&mut tables, "docker.io", "198.19.248.254:1234/t/docker.io".into());
-        registries(&mut tables, &c);
+        registries(&mut tables, &c, &["docker.io".into(), "10.1.2.3:5000".into(), "ghcr.io".into()]);
         let names: Vec<&str> = tables.iter().map(|(r, _)| r.as_str()).collect();
-        assert_eq!(names, ["docker.io", "mirror.lan:5000", "registry.lan:5000"]);
+        assert_eq!(names, ["docker.io", "mirror.lan:5000", "registry.lan:5000", "10.1.2.3:5000"]);
         assert_eq!(tables[0].1.mirrors, ["198.19.248.254:1234/t/docker.io", "mirror.lan:5000", "m.example.com/docker.io"]);
-        assert_eq!(tables[1].1, Table { mirrors: vec![], http: true, insecure: true });
-        assert_eq!(tables[2].1, Table { mirrors: vec![], http: true, insecure: true });
+        for t in &tables[1..] {
+            assert_eq!(t.1, Table { mirrors: vec![], http: true, insecure: true });
+        }
         let mut none = Vec::new();
-        registries(&mut none, &kiri_image::RegistryConfig::default());
+        registries(&mut none, &kiri_image::RegistryConfig::default(), &["ghcr.io".into()]);
         assert!(none.is_empty());
+    }
+
+    /// A plain-HTTP mirror on a host nobody listed: a pull does not use it,
+    /// and neither does a build, and its host stays verified HTTPS for
+    /// everything else (`FROM mirror.lan:5000/x`, a push).
+    #[test]
+    fn a_build_and_a_pull_agree_on_a_plain_http_mirror() {
+        let c = kiri_image::RegistryConfig { mirrors: vec![kiri_image::Mirror::parse("http://mirror.lan:5000").unwrap()], ..Default::default() };
+        let mut tables = Vec::new();
+        registries(&mut tables, &c, &[]);
+        assert!(tables.is_empty(), "{tables:?}");
+        assert_eq!(c.usable_mirrors().count(), 0);
     }
 
     #[test]
