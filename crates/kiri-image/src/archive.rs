@@ -182,7 +182,7 @@ pub fn from_config(name: String, config_digest: &str, config: &Value, layers: Ve
     // A config that names no architecture was made for this machine.
     let host = crate::registry::Platform::host_linux();
     let arch = config["architecture"].as_str().unwrap_or(&host.architecture);
-    Image {
+    Image { mirror: None,
         name,
         // Loaded images have no registry manifest; the config names them.
         digest: config_digest.to_owned(),

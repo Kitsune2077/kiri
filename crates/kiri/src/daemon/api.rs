@@ -1157,6 +1157,7 @@ fn run_pull(req: &Request, engine: &Engine, reference: &Reference, job: &super::
             let reason: String = reason.chars().take(120).collect();
             line(json!({"status": format!("{mirror}: {reason}; trying the next registry")}));
         }
+        Progress::FromMirror { mirror } => line(json!({"status": format!("Pulled from the mirror {mirror}")})),
         // Docker's own lines, so `docker pull` draws its bars; `size` is
         // extra, for the window's overall bar, and the CLI ignores it.
         Progress::Layer { digest, size, .. } => line(json!({"status": "Pulling fs layer", "progressDetail": {}, "id": short(&digest), "size": size})),
@@ -3641,7 +3642,7 @@ mod tests {
     }
 
     fn test_image(name: &str) -> kiri_image::Image {
-        kiri_image::Image {
+        kiri_image::Image { mirror: None,
             name: name.into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         }
@@ -5001,7 +5002,7 @@ mod leave_first_network_tests {
         std::fs::create_dir_all(&root).unwrap();
         let engine = super::super::engine::boot_without_vm(&root);
         engine.lock_net().create("probe-net", Default::default()).unwrap();
-        let image = kiri_image::Image {
+        let image = kiri_image::Image { mirror: None,
             name: "test:1".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };

@@ -4975,7 +4975,7 @@ mod image_lookup_tests {
     const ARM64: &str = "sha256:6a3345f517a7df05185c648f83d18d464f2a94ea4a69eaee39b7e1de02611e59";
 
     fn image(name: &str, index: Option<&str>) -> Image {
-        Image {
+        Image { mirror: None,
             name: name.into(),
             digest: ARM64.into(),
             index_digest: index.map(str::to_owned),
@@ -5496,7 +5496,7 @@ mod vm_recovery_tests {
         let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
         // No real VM: the start below stands in for the guest's answers.
         engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -5590,7 +5590,7 @@ mod vm_recovery_tests {
         let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
         // No real VM: the threads below stand in for the guest.
         engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -5704,7 +5704,7 @@ mod vm_recovery_tests {
     fn a_policy_start_waits_while_kiri_stops() {
         let dir = std::env::temp_dir().join(format!("kiri-vm-parking-{}", std::process::id()));
         let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -5748,7 +5748,7 @@ mod vm_recovery_tests {
         let engine = Engine::boot(store).unwrap();
         // Prevent any real VM boot: this test supplies the guest events.
         engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -6053,7 +6053,7 @@ mod records_tests {
     use std::path::Path;
 
     fn image() -> Image {
-        Image {
+        Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         }
@@ -6469,7 +6469,7 @@ mod save_speed_tests {
         let _ = std::fs::remove_dir_all(&root);
         let engine = Engine::boot(Store::open(&root).unwrap()).unwrap();
         engine.stopped.store(true, Ordering::SeqCst);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -6564,7 +6564,7 @@ mod start_wait_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let engine = Engine::boot(Store::open(&dir).unwrap()).unwrap();
         engine.stopped.store(true, std::sync::atomic::Ordering::SeqCst);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -6860,7 +6860,7 @@ mod start_wait_tests {
     /// C fills v1 for a long time; B uses v2; A uses both.
     fn three(name: &str) -> (Arc<Engine>, [String; 3], PathBuf) {
         let (engine, c, dir) = engine(name);
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };
@@ -7038,7 +7038,7 @@ mod leave_first_network_tests {
             let ipam = parse_ipam(&serde_json::json!({"Config": [{"Subnet": format!("10.98.{i}.0/24")}]})).unwrap();
             engine.lock_networks().create(net, Settings { ipam, internal: *internal, ..Default::default() }).unwrap();
         }
-        let image = Image {
+        let image = Image { mirror: None,
             name: "test:local".into(), digest: "sha256:test".into(), index_digest: None, config_digest: "sha256:test".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };

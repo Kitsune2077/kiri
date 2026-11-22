@@ -700,7 +700,7 @@ mod disk_usage_tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("containers.json.corrupt-1-0"), b"[{\"id\":").unwrap();
         let engine = super::super::engine::boot_without_vm(&root);
-        let image = kiri_image::Image {
+        let image = kiri_image::Image { mirror: None,
             name: "sha256:0123".into(), digest: "sha256:0123".into(), index_digest: None, config_digest: "sha256:0123".into(),
             layers: Vec::new(), size: 0, platform: "linux/arm64".into(), created: String::new(), pulled_at: 0, config: Default::default(),
         };

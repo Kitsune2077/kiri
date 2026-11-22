@@ -74,6 +74,10 @@ pub struct Image {
     /// Unix seconds when this image was pulled.
     pub pulled_at: u64,
     pub config: RunConfig,
+    /// The Docker Hub mirror (`host[:port]`) a pull took the image from,
+    /// when it did not come from the registry its name says.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mirror: Option<String>,
 }
 
 impl Image {
@@ -652,7 +656,7 @@ mod tests {
         let mut ingest = store.ingest().unwrap();
         ingest.write_all(b"a layer a save is sending").unwrap();
         let (layer, size) = ingest.finish().unwrap();
-        let image = |name: &str| Image {
+        let image = |name: &str| Image { mirror: None,
             name: name.into(),
             digest: "sha256:manifest".into(),
             index_digest: None,
@@ -688,7 +692,7 @@ mod tests {
         assert!(store.blob_writer(&path).is_err());
         assert!(store.read_config(&path).is_err());
 
-        let image = Image {
+        let image = Image { mirror: None,
             name: "malicious:latest".into(),
             digest: "sha256:manifest".into(),
             index_digest: None,
@@ -712,7 +716,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-store-index-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let (index, manifest) = (format!("sha256:{}", "1".repeat(64)), format!("sha256:{}", "2".repeat(64)));
-        let image = Image {
+        let image = Image { mirror: None,
             name: format!("kindest/node@{index}"),
             digest: manifest.clone(),
             index_digest: Some(index.clone()),
@@ -739,7 +743,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("kiri-store-push-test-{}", std::process::id()));
         let store = Store::open(&root).unwrap();
         let d = |c: &str| format!("sha256:{}", c.repeat(64));
-        let image = |name: &str, config: &str, index: Option<String>| Image {
+        let image = |name: &str, config: &str, index: Option<String>| Image { mirror: None,
             name: name.into(),
             digest: d(config),
             index_digest: index,
@@ -786,7 +790,7 @@ mod tests {
     }
 
     fn named(name: &str) -> Image {
-        Image {
+        Image { mirror: None,
             name: name.into(),
             digest: format!("sha256:{}", "1".repeat(64)),
             index_digest: None,
@@ -961,7 +965,7 @@ mod tests {
 
     #[test]
     fn repo_strips_a_tag_but_not_a_port() {
-        let named = |name: &str| Image {
+        let named = |name: &str| Image { mirror: None,
             name: name.into(),
             digest: String::new(),
             index_digest: None,
