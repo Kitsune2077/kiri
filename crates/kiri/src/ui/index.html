@@ -11127,7 +11127,7 @@ function regListPane(k) {
     ? tr("Registries reached without a verified certificate (self-signed, or plain HTTP). Kiri tries HTTPS without checking the certificate, then HTTP. Only the hosts and networks listed; every other registry is checked as usual.")
     : tr("Docker Hub images pull through these in order; the first that has the image answers, and Docker Hub itself is the fallback. Other registries are pulled directly.");
   const label = k === "insecure" ? tr("Host or network") : tr("Mirror address");
-  const hint = k === "insecure" ? "registry.lan:5000" : "https://mirror.example.com";
+  const hint = k === "insecure" ? "registry.lan:5000" : "MIRROR_URL";
   const foot = k === "mirrors" ? `<p class="muted">${tr("Kept in {path} with Docker's names, for docker pull, push, login and build. Docker Desktop's file is left alone.", { path: `<span class="mono">${esc(c.path || "~/.kiri/daemon.json")}</span>` })}</p>${(c.problems || []).map((x) => `<p class="muted" role="alert">${tr("Skipped: {problem}", { problem: esc(x) })}</p>`).join("")}` : "";
   return `<div class="pane"><h3>${title}</h3>
     <p class="muted">${about}</p>
