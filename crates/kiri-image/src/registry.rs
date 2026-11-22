@@ -497,6 +497,14 @@ fn is_own_origin(final_url: &str, base: &str) -> bool {
     f == b || (!b.0 && f.0 && f.1 == b.1 && (f.2 == b.2 || (b.2 == 80 && f.2 == 443)))
 }
 
+/// Where a login's Basic credentials may go, for a challenge that came from
+/// `final_url` after asking `url`: there only when it is the registry's own
+/// origin ([`is_own_origin`]: the same one, or the same host moved up to
+/// HTTPS), never anywhere a redirect took the request.
+fn basic_login_target(final_url: &str, url: &str) -> Option<String> {
+    is_own_origin(final_url, url).then(|| final_url.to_owned())
+}
+
 /// The scheme, host and port a URL names (the default port of its scheme if
 /// it has none): what must all match for a request to stay "the same place".
 fn origin_of(url: &str) -> Option<(bool, String, u16)> {
@@ -1592,10 +1600,15 @@ impl Client {
             401 => {
                 let challenge = resp.headers().get("www-authenticate").and_then(|v| v.to_str().ok()).unwrap_or_default().to_owned();
                 if challenge.get(..5).is_some_and(|s| s.eq_ignore_ascii_case("basic")) {
-                    let (auth, _) = self.answer(&challenge, "", host)?;
                     // Where the challenge came from: the registry moved up to
-                    // HTTPS answers there, not at the plain-HTTP address.
-                    let at = final_url(&resp).unwrap_or_else(|| url.clone());
+                    // HTTPS answers there, not at the plain-HTTP address. Any
+                    // other origin is refused before credentials are made.
+                    let at = final_url(&resp).and_then(|f| basic_login_target(&f, &url)).ok_or_else(|| Error::Status {
+                        url: url.clone(),
+                        status: 401,
+                        body: "unauthorized: the registry sent the request elsewhere".into(),
+                    })?;
+                    let (auth, _) = self.answer(&challenge, "", host)?;
                     let again = self.get_following(&at, host, Some(&auth), &[], &[])?;
                     return match again.status().as_u16() {
                         200 => Ok(()),
@@ -2998,6 +3011,33 @@ mod tests {
         let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
         assert!(heads.contains("get /v2/"), "{heads}");
         assert!(!heads.contains("authorization") && !heads.contains("account=me") && !heads.contains("get /token"), "{heads}");
+    }
+
+    /// A Basic challenge from where a login was redirected (another host)
+    /// is not answered: the credentials go only to the registry's origin.
+    #[test]
+    fn a_basic_challenge_off_the_registry_gets_no_credentials() {
+        let (evil, evil_seen) = recording_server(|_| "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".into());
+        let asked = std::sync::atomic::AtomicUsize::new(0);
+        let (a, _) = recording_server(move |_| {
+            if asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 { "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".into() } else { redirect(&format!("http://{evil}/v2/")) }
+        });
+        let c = test_client().with_credentials(me());
+        assert!(c.login(&a).is_err());
+        let heads = evil_seen.lock().unwrap().join("\n").to_ascii_lowercase();
+        assert!(heads.contains("get /v2/"), "{heads}");
+        assert!(!heads.contains("authorization"), "{heads}");
+    }
+
+    /// The registry moving a login up to HTTPS on its own host answers
+    /// there, and is sent the credentials there.
+    #[test]
+    fn a_basic_login_is_sent_only_to_the_registrys_own_origin() {
+        assert!(basic_login_target("https://r.lan/v2/", "http://r.lan/v2/").is_some());
+        assert!(basic_login_target("http://r.lan:5000/v2/", "http://r.lan:5000/v2/").is_some());
+        assert!(basic_login_target("https://evil.example/v2/", "https://r.lan/v2/").is_none());
+        assert!(basic_login_target("http://r.lan:6000/v2/", "http://r.lan:5000/v2/").is_none());
+        assert!(basic_login_target("http://r.lan/v2/", "https://r.lan/v2/").is_none());
     }
 
     /// The same with a list of networks (the slow path, where the verified
