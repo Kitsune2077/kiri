@@ -73,12 +73,33 @@ impl Insecure {
     }
 }
 
+/// IPv6 ranges that hold IPv4 addresses in their last 32 bits: mapped
+/// (`::ffff:a.b.c.d`), the old compatible form (`::a.b.c.d`) and NAT64's
+/// well-known prefix (`64:ff9b::a.b.c.d`). A network in one is as wide as
+/// the IPv4 network it holds.
+const IPV4_IN_IPV6: [Ipv6Addr; 3] = [Ipv6Addr::new(0, 0, 0, 0, 0, 0xffff, 0, 0), Ipv6Addr::UNSPECIFIED, Ipv6Addr::new(0x64, 0xff9b, 0, 0, 0, 0, 0, 0)];
+
 /// Whether a network may be listed: one inside the ranges that are never on
 /// the internet (private, shared, loopback, link-local and unique-local
 /// addresses), or a small one anywhere (a /16 or longer for IPv4, a /48 or
 /// longer for IPv6). A few short networks (`0.0.0.0/1` and `128.0.0.0/1`)
-/// would otherwise make every registry named by its address insecure.
+/// would otherwise make every registry named by its address insecure. An
+/// IPv6 network over IPv4 addresses ([`IPV4_IN_IPV6`]) is judged as the
+/// IPv4 network it holds, and one that takes in a whole such range is not
+/// narrow at any width.
 fn narrow_enough(net: IpAddr, bits: u8) -> bool {
+    if let IpAddr::V6(v6) = net {
+        for range in IPV4_IN_IPV6 {
+            let range = IpAddr::V6(range);
+            if bits >= 96 && mask(net, 96) == range {
+                let [.., a, b, c, d] = v6.octets();
+                return narrow_enough(IpAddr::V4(Ipv4Addr::new(a, b, c, d)), bits - 96);
+            }
+            if bits < 96 && mask(range, bits) == net {
+                return false;
+            }
+        }
+    }
     let inside = |base: IpAddr, len: u8| bits >= len && mask(net, len) == base;
     let v4 = |a: [u8; 4], len: u8| inside(IpAddr::V4(Ipv4Addr::from(a)), len);
     let v6 = |a: &str, len: u8| a.parse::<Ipv6Addr>().is_ok_and(|a| inside(IpAddr::V6(a), len));
@@ -298,6 +319,18 @@ mod tests {
         // Private and other never-routed ranges, at any width inside them,
         // and small networks anywhere.
         for ok in ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "fc00::/7", "fd12:3456::/32", "fe80::/10", "203.0.113.0/24", "198.51.0.0/16", "2001:db8:1::/48"] {
+            assert!(Insecure::parse(ok).is_ok(), "{ok}");
+        }
+    }
+
+    /// IPv6 networks over IPv4 addresses are as wide as the IPv4 network in
+    /// them: all of IPv4 written as mapped or NAT64 addresses is refused.
+    #[test]
+    fn ipv4_written_as_ipv6_is_held_to_the_ipv4_widths() {
+        for wide in ["::ffff:0:0/96", "::ffff:0.0.0.0/97", "::/48", "::/64", "::/95", "::/96", "64:ff9b::/96", "64:ff9b::/64", "::ffff:8.0.0.0/104", "::ffff:0:0/80"] {
+            assert!(Insecure::parse(wide).is_err(), "{wide}");
+        }
+        for ok in ["::ffff:10.0.0.0/104", "::ffff:192.168.0.0/112", "::ffff:203.0.113.0/120", "64:ff9b::10.1.0.0/112", "::1/128", "::ffff:198.51.0.0/112"] {
             assert!(Insecure::parse(ok).is_ok(), "{ok}");
         }
     }
