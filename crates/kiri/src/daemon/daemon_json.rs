@@ -29,6 +29,10 @@ const MAX_INSECURE: usize = 256;
 const MAX_BYTES: u64 = 256 << 10;
 /// Problems kept and shown; the rest are counted.
 const MAX_PROBLEMS: usize = 32;
+/// The longest entry either list is read from: a mirror's address with a
+/// long host and path is about half this. A longer one is said to be wrong
+/// without being repeated back.
+const MAX_ENTRY: usize = 600;
 
 pub fn path() -> Option<PathBuf> {
     super::state_dir().ok().map(|d| d.join("daemon.json"))
@@ -46,12 +50,18 @@ fn stamp_of(m: &std::fs::Metadata) -> Stamp {
     (m.modified().unwrap_or(SystemTime::UNIX_EPOCH), m.len(), ino)
 }
 
-/// The file's bytes, if it is a regular file of a sane size. Looked at
-/// before it is opened: opening a FIFO would wait for a writer, and
-/// `/dev/zero` never ends.
+/// The file's bytes, if it is a regular file of a sane size. Opened without
+/// waiting (a FIFO would wait for a writer) and then looked at, the file
+/// that was opened rather than whatever the path names by then: a FIFO or
+/// `/dev/zero` (which never ends) is refused before anything is read.
 fn read_limited(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
-    let m = std::fs::metadata(path)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut options, libc::O_NONBLOCK);
+    let file = options.open(path)?;
+    let m = file.metadata()?;
     if !m.is_file() {
         return Err(std::io::Error::other("not a regular file"));
     }
@@ -59,7 +69,7 @@ fn read_limited(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
         return Err(std::io::Error::other(format!("larger than {} KiB", MAX_BYTES >> 10)));
     }
     let mut bytes = Vec::new();
-    std::fs::File::open(path)?.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
     if bytes.len() as u64 > MAX_BYTES {
         return Err(std::io::Error::other(format!("larger than {} KiB", MAX_BYTES >> 10)));
     }
@@ -107,7 +117,7 @@ fn with_current<T>(f: impl FnOnce(&Read) -> T) -> T {
 /// daemon keeps running with the entries it could read and says what it
 /// skipped (Settings and `kiri registry` show it).
 fn parse(bytes: &[u8]) -> (RegistryConfig, Vec<String>) {
-    let mut problems = Vec::new();
+    let mut problems = Problems::default();
     let v: Value = match serde_json::from_slice(bytes) {
         Ok(v @ Value::Object(_)) => v,
         Ok(_) => return (RegistryConfig::default(), vec!["daemon.json is not a JSON object".into()]),
@@ -117,31 +127,81 @@ fn parse(bytes: &[u8]) -> (RegistryConfig, Vec<String>) {
     let (insecure, mirrors) = (read(INSECURE), read(MIRRORS));
     let mut parsed = Vec::new();
     for s in insecure {
-        match Insecure::parse(&s) {
+        match entry(&s).and_then(Insecure::parse) {
             Ok(e) => parsed.push(e),
-            Err(e) => problems.push(format!("{INSECURE}: {e}")),
+            Err(e) => problems.push(|| format!("{INSECURE}: {e}")),
         }
     }
     let insecure = capped(parsed.into_iter(), INSECURE, MAX_INSECURE, &mut problems);
     let mut parsed = Vec::new();
     for s in mirrors {
-        match Mirror::parse(&s) {
+        match entry(&s).and_then(Mirror::parse) {
             Ok(m) => parsed.push(m),
-            Err(e) => problems.push(format!("{MIRRORS}: {e}")),
+            Err(e) => problems.push(|| format!("{MIRRORS}: {e}")),
         }
     }
     let mirrors = capped(parsed.into_iter(), MIRRORS, MAX_MIRRORS, &mut problems);
-    if problems.len() > MAX_PROBLEMS {
-        let more = problems.len() - MAX_PROBLEMS;
-        problems.truncate(MAX_PROBLEMS);
-        problems.push(format!("and {more} more"));
+    let mut config = RegistryConfig { insecure, mirrors };
+    let (usable, plain): (Vec<Mirror>, Vec<Mirror>) = config.mirrors.iter().cloned().partition(|m| config.mirror_allowed(m));
+    for m in plain {
+        problems.push(|| format!("{MIRRORS}: {}", plain_mirror(&m)));
     }
-    (RegistryConfig { insecure, mirrors }, problems)
+    config.mirrors = usable;
+    (config, problems.into_list())
+}
+
+/// Why a plain-HTTP mirror is not used.
+fn plain_mirror(m: &Mirror) -> String {
+    format!("{} is plain HTTP: use https://, or list {} in {INSECURE} too", m.as_url(), m.host)
+}
+
+/// An entry as it is parsed, or why it is not: one far longer than any host
+/// or address is wrong, and is not repeated back.
+fn entry(s: &str) -> Result<&str, String> {
+    if s.len() > MAX_ENTRY { Err(format!("an entry of {} characters is not a host or an address", s.len())) } else { Ok(s) }
+}
+
+/// What was wrong with the file: the first [`MAX_PROBLEMS`], each made only
+/// when it is kept, and how many more.
+#[derive(Default)]
+struct Problems {
+    list: Vec<String>,
+    more: usize,
+}
+
+impl Problems {
+    fn push(&mut self, problem: impl FnOnce() -> String) {
+        if self.list.len() < MAX_PROBLEMS {
+            self.list.push(problem());
+        } else {
+            self.more += 1;
+        }
+    }
+
+    fn into_list(mut self) -> Vec<String> {
+        if self.more > 0 {
+            self.list.push(format!("and {} more", self.more));
+        }
+        self.list
+    }
+}
+
+/// What kind of JSON value `v` is, for a problem: the value itself may be
+/// any size.
+fn kind(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "true or false",
+        Value::Number(_) => "a number",
+        Value::String(_) => "a string",
+        Value::Array(_) => "a list",
+        Value::Object(_) => "an object",
+    }
 }
 
 /// `entries` once each, in order, at most `max` of them (the rest are
 /// said, not used).
-fn capped<T: PartialEq>(entries: impl Iterator<Item = T>, key: &str, max: usize, problems: &mut Vec<String>) -> Vec<T> {
+fn capped<T: PartialEq>(entries: impl Iterator<Item = T>, key: &str, max: usize, problems: &mut Problems) -> Vec<T> {
     let mut out: Vec<T> = Vec::new();
     let mut over = 0;
     for e in entries {
@@ -155,12 +215,12 @@ fn capped<T: PartialEq>(entries: impl Iterator<Item = T>, key: &str, max: usize,
         }
     }
     if over > 0 {
-        problems.push(format!("{key}: only the first {max} are used, {over} more are left out"));
+        problems.push(|| format!("{key}: only the first {max} are used, {over} more are left out"));
     }
     out
 }
 
-fn strings(v: &Value, key: &str, problems: &mut Vec<String>) -> Vec<String> {
+fn strings(v: &Value, key: &str, problems: &mut Problems) -> Vec<String> {
     match &v[key] {
         Value::Null => Vec::new(),
         Value::Array(a) => a
@@ -168,13 +228,13 @@ fn strings(v: &Value, key: &str, problems: &mut Vec<String>) -> Vec<String> {
             .filter_map(|e| match e.as_str() {
                 Some(s) => Some(s.to_owned()),
                 None => {
-                    problems.push(format!("{key}: {e} is not a string"));
+                    problems.push(|| format!("{key}: {} is not a string", kind(e)));
                     None
                 }
             })
             .collect(),
         other => {
-            problems.push(format!("{key} must be a list, not {other}"));
+            problems.push(|| format!("{key} must be a list, not {}", kind(other)));
             Vec::new()
         }
     }
@@ -232,8 +292,17 @@ pub fn set(body: &Value) -> Result<Value, String> {
     static SAVING: Mutex<()> = Mutex::new(());
     let _saving = SAVING.lock().unwrap_or_else(|e| e.into_inner());
     let path = path().ok_or_else(|| "HOME is not set".to_owned())?;
-    let existing_mode = std::fs::metadata(&path).ok().map(|m| mode_of(&m));
-    let mut file = match read_limited(&path) {
+    save_at(&path, body)?;
+    // What was read before the rename is not what is there now, even when
+    // the time and size agree.
+    *READ.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    Ok(report())
+}
+
+/// [`set`]'s work on the file at `path`.
+fn save_at(path: &std::path::Path, body: &Value) -> Result<(), String> {
+    let existing_mode = std::fs::metadata(path).ok().map(|m| mode_of(&m));
+    let mut file = match read_limited(path) {
         Ok(b) if b.iter().all(u8::is_ascii_whitespace) => Map::new(),
         Ok(b) => match serde_json::from_slice::<Value>(&b) {
             Ok(Value::Object(m)) => m,
@@ -254,21 +323,29 @@ pub fn set(body: &Value) -> Result<Value, String> {
     if !given {
         return Err(format!("nothing to save: send {INSECURE} or {MIRRORS}"));
     }
+    // A plain-HTTP mirror goes with its host in the insecure list, whichever
+    // of the two lists this save changes.
+    let saved = parse(&serde_json::to_vec(&Value::Object(file.clone())).map_err(|e| e.to_string())?).0;
+    let listed: Vec<Mirror> = file.get(MIRRORS).and_then(Value::as_array).into_iter().flatten().filter_map(Value::as_str).filter_map(|s| Mirror::parse(s).ok()).collect();
+    if let Some(m) = listed.iter().find(|m| !saved.mirror_allowed(m)) {
+        return Err(format!("{MIRRORS}: {}", plain_mirror(m)));
+    }
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     }
     let mut text = serde_json::to_string_pretty(&Value::Object(file)).map_err(|e| e.to_string())?;
     text.push('\n');
+    // What would not be read back is not written.
+    if text.len() as u64 > MAX_BYTES {
+        return Err(format!("{} would be larger than {} KiB", path.display(), MAX_BYTES >> 10));
+    }
     let tmp = path.with_extension("json.tmp");
     write_private(&tmp, text.as_bytes(), existing_mode).map_err(|e| format!("{}: {e}", tmp.display()))?;
-    if let Err(e) = std::fs::rename(&tmp, &path) {
+    if let Err(e) = std::fs::rename(&tmp, path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(format!("{}: {e}", path.display()));
     }
-    // What was read before the rename is not what is there now, even when
-    // the time and size agree.
-    *READ.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    Ok(report())
+    Ok(())
 }
 
 fn mode_of(m: &std::fs::Metadata) -> u32 {
@@ -313,8 +390,8 @@ fn normalize(v: &Value, key: &str, max: usize, check: impl Fn(&str) -> Result<St
     }
     let mut out: Vec<String> = Vec::new();
     for e in given {
-        let s = e.as_str().ok_or_else(|| format!("{key}: {e} is not a string"))?;
-        let n = check(s).map_err(|e| format!("{key}: {e}"))?;
+        let s = e.as_str().ok_or_else(|| format!("{key}: {} is not a string", kind(e)))?;
+        let n = entry(s).and_then(&check).map_err(|e| format!("{key}: {e}"))?;
         if !out.contains(&n) {
             out.push(n);
         }
@@ -410,6 +487,52 @@ mod tests {
             write_private(&tmp, b"{}", Some(0o400)).unwrap();
             assert_eq!(mode(&tmp), 0o400);
         }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_plain_http_mirror_is_used_only_with_its_host_listed() {
+        let (c, problems) = parse(br#"{"registry-mirrors": ["http://mirror.lan:5000", "https://m.example.com"]}"#);
+        assert_eq!(c.mirrors.iter().map(Mirror::as_url).collect::<Vec<_>>(), ["https://m.example.com"]);
+        assert!(problems.iter().any(|p| p.contains("plain HTTP")), "{problems:?}");
+        let (c, problems) = parse(br#"{"insecure-registries": ["mirror.lan:5000"], "registry-mirrors": ["http://mirror.lan:5000", "http://127.0.0.1:5000"]}"#);
+        assert_eq!(c.mirrors.len(), 2, "{problems:?}");
+        assert!(problems.is_empty(), "{problems:?}");
+
+        let d = scratch("plain-mirror");
+        let f = d.join("daemon.json");
+        assert!(save_at(&f, &json!({MIRRORS: ["http://mirror.lan:5000"]})).unwrap_err().contains("plain HTTP"));
+        assert!(!f.exists(), "nothing written");
+        save_at(&f, &json!({INSECURE: ["mirror.lan:5000"], MIRRORS: ["http://mirror.lan:5000"]})).unwrap();
+        // And the host cannot be taken out of the list while the mirror needs it.
+        assert!(save_at(&f, &json!({INSECURE: []})).unwrap_err().contains("plain HTTP"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn what_is_wrong_is_said_briefly() {
+        // A huge entry or value is said to be wrong, not repeated back.
+        let huge = "a".repeat(200_000);
+        let text = format!(r#"{{"insecure-registries": ["{huge}", {{"k": "{huge}"}}], "registry-mirrors": {{"k": "{huge}"}}}}"#);
+        let (_, problems) = parse(text.as_bytes());
+        assert_eq!(problems.len(), 3, "{problems:?}");
+        assert!(problems.iter().all(|p| p.len() < 200), "{problems:?}");
+        assert!(normalize(&json!([huge]), INSECURE, 8, |s| Insecure::parse(s).map(|e| e.as_string())).unwrap_err().len() < 200);
+        assert!(normalize(&json!([{"k": huge}]), INSECURE, 8, |s| Insecure::parse(s).map(|e| e.as_string())).unwrap_err().len() < 200);
+    }
+
+    #[test]
+    fn a_save_that_would_not_be_read_back_is_not_written() {
+        let d = scratch("too-big");
+        let f = d.join("daemon.json");
+        // Another key of the person's, just under the size the daemon reads.
+        let other = "x".repeat(MAX_BYTES as usize - 200);
+        std::fs::write(&f, format!(r#"{{"note": "{other}"}}"#)).unwrap();
+        let before = std::fs::read(&f).unwrap();
+        let entries: Vec<String> = (0..40).map(|i| format!("registry-{i}.lan:5000")).collect();
+        assert!(save_at(&f, &json!({INSECURE: entries})).unwrap_err().contains("larger"));
+        assert_eq!(std::fs::read(&f).unwrap(), before, "the file is as it was");
+        assert!(read_limited(&f).is_ok());
         let _ = std::fs::remove_dir_all(&d);
     }
 

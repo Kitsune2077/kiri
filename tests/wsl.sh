@@ -160,7 +160,7 @@ t insecure-http-pull "Downloaded newer image" "docker pull $RIP:5055/team/alp:1 
 t insecure-http-push "pushed" "docker tag alpine $RIP:5055/team/pushed:1 && docker push $RIP:5055/team/pushed:1 >/dev/null 2>&1 && curl -s localhost:5055/v2/team/pushed/tags/list | grep -q '\"1\"' && echo pushed"
 cj insecure-cli-remove "no insecure registries" "$KR insecure remove $RIP:5055"
 t insecure-removed-refused "refused" "docker rmi $RIP:5055/team/alp:1 >/dev/null 2>&1; docker pull $RIP:5055/team/alp:1 >/dev/null 2>&1 && echo pulled || echo refused"
-cj mirror-cli-add "http://$RIP:5055" "$KR mirror add http://$RIP:5055"
+cj mirror-cli-add "http://$RIP:5055" "$KR insecure add $RIP:5055 >/dev/null; $KR mirror add http://$RIP:5055"
 t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
 t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
 cj insecure-cleanup "no registry mirrors" "$KR mirror remove http://$RIP:5055; rm -f /var/lib/kiri-daemon/.kiri/daemon.json"

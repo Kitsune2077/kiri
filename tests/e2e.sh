@@ -1461,10 +1461,13 @@ if [ -n "$HOSTIP" ]; then
   t insecure-docker-info "$HOSTIP:5055" bash -c "$D info 2>/dev/null | sed -n '/Insecure Registries/,/^ [A-Z]/p'"
   t insecure-cli-remove "no insecure registries" "$KIRI" registry insecure remove "$HOSTIP:5055"
   t insecure-removed-refused "refused" bash -c "$R rmi $HOSTIP:5055/team/alp:3 >/dev/null 2>&1; $R pull $HOSTIP:5055/team/alp:3 >/dev/null 2>&1 && echo pulled || echo refused"
+  # A plain-HTTP mirror goes with its host in the insecure list.
+  t mirror-cli-plain-needs-listing "plain HTTP" bash -c "\"$KIRI\" registry mirror add http://$HOSTIP:5056 2>&1"
+  "$KIRI" registry insecure add "$HOSTIP:5056" >/dev/null
   t mirror-cli-add "http://$HOSTIP:5056" "$KIRI" registry mirror add "http://$HOSTIP:5056"
   t mirror-http-pull "3." bash -c "$D pull -q kiri-mirror-only:1 >/dev/null && $D run --rm kiri-mirror-only:1 cat /etc/alpine-release"
   t mirror-docker-info "http://$HOSTIP:5056/" bash -c "$D info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
-  "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
+  "$KIRI" registry mirror remove "http://$HOSTIP:5056" >/dev/null 2>&1; "$KIRI" registry insecure remove "$HOSTIP:5056" >/dev/null 2>&1; $R logout "$HOSTIP:5055" >/dev/null 2>&1
   $D rmi kiri-mirror-only:1 >/dev/null 2>&1; $D rm -f reg2 >/dev/null
 else
   skip insecure-registries "this computer has no network address to reach the registry at"

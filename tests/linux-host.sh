@@ -330,7 +330,7 @@ t insecure-http-unlisted-refused "refused" "docker pull kiri-trusted.test:5055/t
 t insecure-tls-unlisted-refused "refused" "docker pull kiri-other.test:5444/team/alp:1 >/dev/null 2>&1 $PULLED"
 t insecure-login-unlisted-refused "refused" "echo kiripass | docker login kiri-trusted.test:5056 -u kiriuser --password-stdin >/dev/null 2>&1 && echo signed in || echo refused"
 t insecure-cli-add "kiri-other.test:5444" "/opt/kiri/kiri registry insecure add kiri-trusted.test:5055 kiri-trusted.test:5056 kiri-other.test:5444 $RIP:5055 2>&1"
-t insecure-cli-refuses-everything "every address" "/opt/kiri/kiri registry insecure add 0.0.0.0/0 2>&1"
+t insecure-cli-refuses-everything "internet" "/opt/kiri/kiri registry insecure add 0.0.0.0/0 2>&1"
 t insecure-daemon-json "kiri-trusted.test:5056" "cat /root/.kiri/daemon.json"
 t insecure-http-pull "Downloaded newer image" "docker pull kiri-trusted.test:5055/team/alp:1 2>&1"
 t insecure-http-push "pushed" "docker tag alpine:3.21 kiri-trusted.test:5055/team/pushed:1 && docker push kiri-trusted.test:5055/team/pushed:1 >/dev/null 2>&1 && curl -s localhost:5055/v2/team/pushed/tags/list | grep -q '\"1\"' && echo pushed"
@@ -348,11 +348,11 @@ t insecure-docker-info "kiri-trusted.test:5055" "docker info 2>/dev/null | sed -
 t insecure-build "erucesni-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry insecure add \$gw >/dev/null 2>&1; mkdir -p /bins && printf \"FROM \$gw/team/alp:1\\nRUN echo built-insecure | rev\\n\" > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o erucesni-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
 t insecure-cli-remove "kiri-trusted.test:5056" "/opt/kiri/kiri registry insecure remove kiri-trusted.test:5055 kiri-other.test:5444 2>&1"
 t insecure-removed-refused "refused" "docker rmi kiri-other.test:5444/team/alp:1 >/dev/null 2>&1; docker pull kiri-other.test:5444/team/alp:1 >/dev/null 2>&1 $PULLED"
-t insecure-hand-edit "Downloaded newer image" "printf '{\"insecure-registries\": [\"kiri-other.test:5444\"], \"debug\": true}\\n' > /root/.kiri/daemon.json; docker pull kiri-other.test:5444/team/alp:1 2>&1"
+t insecure-hand-edit "Downloaded newer image" "printf '{\"insecure-registries\": [\"kiri-other.test:5444\", \"$RIP:5055\"], \"debug\": true}\\n' > /root/.kiri/daemon.json; docker pull kiri-other.test:5444/team/alp:1 2>&1"
 t insecure-hand-edit-keeps-keys "kept" "/opt/kiri/kiri registry mirror add http://$RIP:5055 >/dev/null 2>&1; f=/root/.kiri/daemon.json; grep -q '\"debug\": true' \$f && grep -q 'http://$RIP:5055' \$f && grep -q kiri-other.test:5444 \$f && echo kept"
 t mirror-http-pull "Downloaded newer image" "docker pull kiri-mirror-only:1 2>&1"
 t mirror-docker-info "http://$RIP:5055/" "docker info 2>/dev/null | sed -n '/Registry Mirrors/,/^ [A-Z]/p'"
-t mirror-build "rorrim-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry mirror remove http://$RIP:5055 >/dev/null 2>&1; /opt/kiri/kiri registry mirror add http://\$gw >/dev/null 2>&1; docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o rorrim-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
+t mirror-build "rorrim-tliub" "gw=\$(docker inspect kiri-reg-http --format '{{.NetworkSettings.IPAddress}}'):5000; /opt/kiri/kiri registry mirror remove http://$RIP:5055 >/dev/null 2>&1; /opt/kiri/kiri registry insecure add \$gw >/dev/null 2>&1; /opt/kiri/kiri registry mirror add http://\$gw >/dev/null 2>&1; docker rmi kiri-mirror-only:1 >/dev/null 2>&1; printf 'FROM kiri-mirror-only:1\\nRUN echo built-mirror | rev\\n' > /bins/Dockerfile && DOCKER_BUILDKIT=0 docker build --no-cache /bins >/tmp/b.log 2>&1; grep -m1 -o rorrim-tliub /tmp/b.log || grep -i -m3 'error\|fail' /tmp/b.log"
 # Docker Hub is reached over verified HTTPS whatever the list covers: a
 # name server (here /etc/hosts) that puts its name inside a listed network,
 # in front of a plain-HTTP registry on port 80, must not turn the pull into
