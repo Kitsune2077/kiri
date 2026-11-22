@@ -791,7 +791,15 @@ fn insecure_scheme(host: &str) -> &'static str {
     }
     // A server that waits instead of refusing a handshake it can't read
     // gets as long as Docker gives a TLS handshake.
-    let answers = |url: String, agent: ureq::Agent| agent.get(&url).config().timeout_global(Some(Duration::from_secs(10))).build().call().map(drain).is_ok();
+    // An answer from the host itself, any status: not a proxy's word that
+    // it could not reach it (502, 503 or 504 to a plain-HTTP request).
+    let answers = |url: String, agent: ureq::Agent| {
+        agent.get(&url).config().timeout_global(Some(Duration::from_secs(10))).build().call().is_ok_and(|resp| {
+            let gateway = !is_https(&url) && matches!(resp.status().as_u16(), 502..=504);
+            drain(resp);
+            !gateway
+        })
+    };
     // Stopped before it began, or while waiting for another pull's probe:
     // nothing is asked, and nothing learnt.
     if crate::cancel::current_cancelled() {
@@ -3432,6 +3440,27 @@ mod tests {
         assert_eq!(scheme, "https");
         assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
         drop(held);
+    }
+
+    /// A proxy's 502, 503 or 504 to the plain-HTTP probe is the proxy
+    /// failing to reach the host, not the host answering plain HTTP.
+    #[test]
+    fn a_gateway_error_is_not_a_plain_http_answer() {
+        for status in ["502 Bad Gateway", "503 Service Unavailable", "504 Gateway Timeout", "401 Unauthorized"] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
+            let reply = format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            std::thread::spawn(move || {
+                for c in listener.incoming() {
+                    let Ok(mut c) = c else { continue };
+                    // A TLS handshake gets a plain-HTTP answer: no HTTPS here.
+                    let _ = c.read(&mut [0u8; 1024]);
+                    let _ = c.write_all(reply.as_bytes());
+                }
+            });
+            let want = if status.starts_with('4') { "http" } else { "https" };
+            assert_eq!(insecure_scheme(&host), want, "{status}");
+        }
     }
 
     #[test]
