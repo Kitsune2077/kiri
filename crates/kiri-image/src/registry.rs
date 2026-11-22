@@ -775,7 +775,16 @@ fn insecure_scheme(host: &str) -> &'static str {
         probing.retain(|_, l| Arc::strong_count(l) > 1);
         probing.entry(key.clone()).or_default().clone()
     };
-    let _one = lock.lock().unwrap_or_else(|e| e.into_inner());
+    // Waits for another pull's probe of the same host, but no longer than
+    // this pull runs: a stopped pull returns at once.
+    let _one = loop {
+        match lock.try_lock() {
+            Ok(g) => break g,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) if crate::cancel::current_cancelled() => return "https",
+            Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(20)),
+        }
+    };
     // Another pull may have asked while this one waited.
     if let Some(scheme) = remembered_scheme(&key) {
         return scheme;
@@ -3384,19 +3393,45 @@ mod tests {
         let host = format!("127.0.0.1:{}", listener.local_addr().unwrap().port());
         let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let count = accepted.clone();
+        let cancel = Cancel::new();
+        let stop = cancel.clone();
+        // Stopped while the HTTPS probe is out: its connection is dropped
+        // with the pull stopped, and the plain-HTTP probe is never sent.
         std::thread::spawn(move || {
             for c in listener.incoming() {
                 count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                stop.cancel();
                 drop(c);
             }
         });
-        let cancel = Cancel::new();
-        cancel.cancel();
         let _on = cancel.enter();
         assert_eq!(insecure_scheme(&host), "https");
         std::thread::sleep(Duration::from_millis(200));
-        assert!(accepted.load(std::sync::atomic::Ordering::SeqCst) <= 1, "{}", accepted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(accepted.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert_eq!(remembered_scheme(&host), None, "nothing learnt about it");
+    }
+
+    /// A pull stopped while another pull probes the same host returns at
+    /// once, not when that probe ends.
+    #[test]
+    fn a_stopped_pull_does_not_wait_for_another_probe() {
+        let host = "waiting.test:5000";
+        let lock = PROBING.lock().unwrap().entry(host.to_owned()).or_default().clone();
+        let held = lock.lock().unwrap();
+        let cancel = Cancel::new();
+        let stop = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            stop.cancel();
+        });
+        let started = Instant::now();
+        let scheme = {
+            let _on = cancel.enter();
+            insecure_scheme(host)
+        };
+        assert_eq!(scheme, "https");
+        assert!(started.elapsed() < Duration::from_secs(2), "{:?}", started.elapsed());
+        drop(held);
     }
 
     #[test]
